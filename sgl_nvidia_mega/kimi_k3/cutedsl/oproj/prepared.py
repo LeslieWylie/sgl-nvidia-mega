@@ -17,7 +17,14 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import dynamic_fake, dynamic_view, fake, stream, to_cute
+from ..common.host import (
+    dynamic_fake,
+    dynamic_view,
+    fake,
+    stream,
+    to_cute,
+    validate_init_barrier_group,
+)
 from ..common.policy import batch_table
 from .consumer import OprojConsumer, OprojFused
 from .producer import OprojProducer, OprojUmma
@@ -26,7 +33,8 @@ from .producer import OprojProducer, OprojUmma
 class OprojMailbox:
     """Sentinel-armed multicast mailbox; defaults to [parity, TP, 64, 7168] BF16."""
 
-    def __init__(self, group, device, tp, rank, shape=None):
+    def __init__(self, group, device, tp, rank, shape=None, *, init_barrier_group=None):
+        init_group = validate_init_barrier_group(group, init_barrier_group)
         self.tp, self.rank = tp, rank
         shape = (2, tp, 64, 7168) if shape is None else shape
         self.buffer = symm_mem.empty(shape, dtype=torch.bfloat16, device=device)
@@ -38,7 +46,7 @@ class OprojMailbox:
             )
         self.buffer.view(torch.int32).fill_(-0x80000000)
         torch.accelerator.synchronize(device)
-        torch.distributed.barrier(group=group)
+        torch.distributed.barrier(group=init_group)
 
     def slot(self, parity):
         return self.buffer[parity], self.mc + parity * self.buffer[0].numel() * 2

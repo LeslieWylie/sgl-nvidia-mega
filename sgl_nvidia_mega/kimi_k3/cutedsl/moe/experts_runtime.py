@@ -112,7 +112,17 @@ def scratch(tp, device):
 
 
 class PersistentExperts:
-    def __init__(self, w13, s13, w2, s2, *, beta=4.0, linear_beta=25.0):
+    def __init__(
+        self,
+        w13,
+        s13,
+        w2,
+        s2,
+        *,
+        beta=4.0,
+        linear_beta=25.0,
+        resident_sms=None,
+    ):
         experts, rows, _ = w13.shape
         self.tp, self.grid = (8, 136) if rows == 768 else (16, 152)
         self.device, self.experts = w13.device, experts
@@ -121,6 +131,13 @@ class PersistentExperts:
         # one-wave tail; grouped B9-64 on 152.
         grids = "3-4:148,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
         self.grids = batch_table(grids)
+        if resident_sms is not None:
+            if self.tp != 8 or resident_sms < 148:
+                raise ValueError("K3 native MLA profile needs TP8 and at least 148 SMs")
+            self.grid = min(self.grid, resident_sms)
+            self.grids = {
+                batch: min(grid, resident_sms) for batch, grid in self.grids.items()
+            }
         scalars = (beta * linear_beta, 1 / beta, 1 / linear_beta)
         self.scalars = tuple(map(c.Float32, scalars))
         # The experts kernel uses maps 0-1 (L2 promotion on w13); the TP8 B1 cluster

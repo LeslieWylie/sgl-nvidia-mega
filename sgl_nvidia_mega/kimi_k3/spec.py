@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from sglang.srt.runtime_context import get_model
 
+from .profile import full_decode_enabled, native_config_reasons, native_mla_enabled
+
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import (
         BuildContext,
@@ -38,7 +40,11 @@ if TYPE_CHECKING:
     except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         from sglang.srt.megakernels.binding import PreparationView
 
-WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+NATIVE_MLA = native_mla_enabled()
+FULL_DECODE = full_decode_enabled()
+EXTENDED_PROFILE = NATIVE_MLA or FULL_DECODE
+BASE_WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+WIDTHS = (*BASE_WIDTHS[:-1], 48, 64) if EXTENDED_PROFILE else BASE_WIDTHS
 # Keep this independent of the host constant so find_spec rejects incompatibility.
 REQUIRED_MEGAKERNEL_API_VERSION = 2
 
@@ -66,8 +72,11 @@ SGLANG_READS = {
     ),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "PreparationView",
+        "MegakernelBinding",
+        "megakernel_agree",
+        "native_mla_supports_backend",
     ),
-    "srt/runtime_context.py": ("get_model",),
+    "srt/runtime_context.py": ("get_model", "get_parallel"),
     "srt/arg_groups/fields/*.py": (
         "context_length",
         "cuda_graph_config",
@@ -80,12 +89,40 @@ SGLANG_READS = {
         "moe_runner_backend",
         "page_size",
         "prefill_attention_backend",
+        "dcp_size",
+        "attn_cp_size",
+        "enable_prefill_cp",
     ),
     "srt/models/kimi_k3.py": (
         "KimiK3ForConditionalGeneration",
         "language_model",
         "logits_processor",
         "lm_head",
+    ),
+    "srt/configs/kimi_linear.py": (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "mla_use_nope",
+        "mla_use_output_gate",
+        "hidden_act",
+        "n_routed_experts",
+        "num_experts",
+        "num_experts_per_token",
+        "num_expert_group",
+        "topk_group",
+        "moe_router_activation_func",
+        "routed_expert_hidden_size",
+        "moe_intermediate_size",
+        "num_shared_experts",
+        "latent_moe_use_norm",
+        "linear_attn_config",
+        "attn_res_block_size",
     ),
 }
 
@@ -119,8 +156,83 @@ def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
     graph_config = cfg.cuda_graph_config
     if graph_config is None or graph_config.decode.backend != "full":
         reasons.append("needs the FULL decode CUDA-graph backend")
-    if int(cfg.context_length or 0) != 8192:
+    if EXTENDED_PROFILE:
+        reasons.extend(native_config_reasons(cfg))
+        try:
+            from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
+
+            if getattr(MegakernelBinding, "native_mla_api_version", 0) != 1:
+                reasons.append(
+                    "extended decode profile requires SGLang native MLA API v1"
+                )
+            if getattr(cfg, "decode_attention_backend", None) == "cutedsl_mla":
+                supports = getattr(
+                    MegakernelBinding, "native_mla_supports_backend", None
+                )
+                if not callable(supports) or not supports("cutedsl_mla"):
+                    reasons.append(
+                        "extended Cute DSL decode requires SGLang's native "
+                        "MLA backend capability"
+                    )
+        except ModuleNotFoundError:
+            reasons.append("extended decode profile requires SGLang native MLA API v1")
+    elif int(cfg.context_length or 0) != 8192:
         reasons.append("initial Kimi K3 coverage requires context length 8192")
+    return reasons
+
+
+def _kernel_config_disable_reasons(config: Any) -> list[str]:
+    """Reject native K3 variants the fixed geometry/routing kernels cannot run.
+
+    In particular, valid native softmax/grouped/top-k variants must not silently
+    become the prepared router's one-group sigmoid top-16. SiTU coefficients,
+    routed scaling and renormalization are supplied to providers dynamically.
+    """
+    expected = {
+        "hidden_size": 7168,
+        "num_hidden_layers": 93,
+        "num_attention_heads": 96,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "mla_use_nope": True,
+        "mla_use_output_gate": True,
+        "hidden_act": "situ",
+        "n_routed_experts": 896,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "moe_router_activation_func": "sigmoid",
+        "routed_expert_hidden_size": 3584,
+        "moe_intermediate_size": 3072,
+        "num_shared_experts": 2,
+        "latent_moe_use_norm": True,
+    }
+    reasons = [
+        f"prepared Kimi K3 kernels need {name}={value!r}, "
+        f"found {getattr(config, name, None)!r}"
+        for name, value in expected.items()
+        if getattr(config, name, None) != value
+    ]
+    linear = getattr(config, "linear_attn_config", None)
+    linear = linear if isinstance(linear, dict) else {}
+    for name, value in (
+        ("num_heads", 96),
+        ("head_dim", 128),
+        ("short_conv_kernel_size", 4),
+        ("use_full_rank_gate", True),
+    ):
+        if linear.get(name) != value:
+            reasons.append(
+                f"prepared Kimi K3 kernels need linear_attn_config.{name}={value!r}, "
+                f"found {linear.get(name)!r}"
+            )
+    block_size = getattr(config, "attn_res_block_size", None)
+    if type(block_size) is not int or block_size <= 0 or math.ceil(93 / block_size) > 8:
+        reasons.append("prepared Kimi K3 kernels need at most 8 AttnRes blocks")
     return reasons
 
 
@@ -132,7 +244,8 @@ def _model_disable_reasons(model: Any, hf_config: Any) -> list[str]:
     layers = tuple(getattr(getattr(language_model, "model", None), "layers", ()))
     if len(layers) != 93:
         reasons.append(f"needs the full 93-layer model, found {len(layers)} layers")
-    text_config = language_model.config
+    text_config = getattr(language_model, "config", None)
+    reasons.extend(_kernel_config_disable_reasons(text_config))
     full_ids = tuple(
         int(value) for value in getattr(text_config, "full_attention_layer_ids", ())
     )
@@ -169,6 +282,7 @@ class _Built:
     draft_extend = None
     begin_draft_round = None
     graph_variants = None
+    speculative_runtime_hooks = None
 
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         from .executor import KimiK3MegakernelExecutor
@@ -182,7 +296,15 @@ class _Built:
         model.__dict__["_nvidia_kimi_k3_megakernel"] = self
 
     def summary(self) -> str:
-        return "TP8 one-token decode at rows 1-8, 16, 32, and 64"
+        suffix = (
+            "; native MLA/DCP and cache restore hooks"
+            if getattr(self.resources, "native_mla", False)
+            else ""
+        )
+        if getattr(self.resources, "full_decode", False):
+            suffix = "; fused MLA/DCP, skinny projection, embedding and L2 prefetch"
+        rows = ", ".join(map(str, self.widths))
+        return f"TP8 one-token decode at prepared rows {rows}" + suffix
 
     def plan(
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
@@ -244,27 +366,65 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
         )
     if context.binding is None:
         raise ValueError("Kimi K3 megakernel received no SGLang runtime binding")
+    native_mla = NATIVE_MLA
+    if EXTENDED_PROFILE and getattr(context.binding, "native_mla_api_version", 0) != 1:
+        raise ValueError("extended decode profile requires SGLang native MLA API v1")
     deadline_ns = _deadline_ns(context.deadline_s)
     from .compat import validate_runtime_compatibility
 
     validate_runtime_compatibility()
+    if FULL_DECODE:
+        from .compat import validate_tokenspeed_compatibility
+
+        validate_tokenspeed_compatibility()
     from .providers import _cuda_memory, build_resources
+
+    if EXTENDED_PROFILE:
+        import torch
+        from sglang.srt.kernel_plugins.nvidia.binding import megakernel_agree
+        from sglang.srt.runtime_context import get_parallel
+
+        megakernel_agree(
+            (
+                int(get_model().context_length),
+                int(get_parallel().attn_dcp_size),
+                int(
+                    torch.cuda.get_device_properties(
+                        torch.cuda.current_device()
+                    ).multi_processor_count
+                ),
+            ),
+            what="K3 extended decode context/DCP/SM topology",
+        )
 
     resources = build_resources(
         model.language_model,
         context_length=int(get_model().context_length),
         memory_before=_cuda_memory(),
         deadline_ns=deadline_ns,
+        **(
+            {"native_mla": True, "batches": widths}
+            if native_mla
+            else {"full_decode": True, "batches": widths}
+            if FULL_DECODE
+            else {}
+        ),
     )
     return _Built(model, resources, widths)
 
 
 SPEC = MegakernelSpec(
-    name="Kimi K3 packed-MXFP4",
+    name=(
+        "Kimi K3 packed-MXFP4 (full decode)"
+        if FULL_DECODE
+        else "Kimi K3 packed-MXFP4 (native MLA)"
+        if NATIVE_MLA
+        else "Kimi K3 packed-MXFP4"
+    ),
     requires=Requirements(
         isas=frozenset({"sm_103"}),
         tp_sizes=frozenset({8}),
-        resident_blocks=152,
+        resident_blocks=148 if EXTENDED_PROFILE else 152,
         dtypes=frozenset({"bfloat16"}),
         decode_graph_backends=frozenset({"full"}),
         server_args={
@@ -272,15 +432,27 @@ SPEC = MegakernelSpec(
             "moe_runner_backend": frozenset({"flashinfer_mxfp4"}),
             "flashinfer_mxfp4_moe_precision": frozenset({"default"}),
             "prefill_attention_backend": frozenset({"trtllm_mla"}),
-            "decode_attention_backend": frozenset({"trtllm_mla"}),
+            "decode_attention_backend": (
+                frozenset({"trtllm_mla", "cutedsl_mla"})
+                if EXTENDED_PROFILE
+                else frozenset({"trtllm_mla"})
+            ),
             "page_size": frozenset({64}),
             "dp_size": frozenset({1}),
             "enable_unified_memory": frozenset({False}),
             "enable_page_major_kv_layout": frozenset({False}),
         },
-        hf_config={"language_only": True, "encoder_only": False},
+        hf_config=(
+            {"encoder_only": False}
+            if EXTENDED_PROFILE
+            else {"language_only": True, "encoder_only": False}
+        ),
     ),
-    features=frozenset({Feature.MULTI_NODE_TP}),
+    features=(
+        frozenset({Feature.CONTEXT_PARALLEL, Feature.KV_OFFLOAD})
+        if EXTENDED_PROFILE
+        else frozenset({Feature.MULTI_NODE_TP})
+    ),
     numerics=Numerics(
         kind=NumericsKind.TOLERANCE,
         tolerances={"forward.selected_logprobs.max_abs": 0.5},

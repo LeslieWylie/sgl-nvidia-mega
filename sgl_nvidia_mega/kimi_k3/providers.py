@@ -43,8 +43,22 @@ _MAX_BATCH = max(_BATCHES)
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
-    "srt/distributed/parallel_state.py": ("device_group",),
-    "srt/arg_groups/fields/parallel.py": ("tp_group", "tp_rank", "tp_size"),
+    "srt/distributed/parallel_state.py": ("device_group", "cpu_group"),
+    "srt/arg_groups/fields/parallel.py": (
+        "tp_group",
+        "tp_rank",
+        "tp_size",
+        "attn_dcp_size",
+        "attn_dcp_rank",
+        "dcp_group",
+    ),
+    "srt/layers/vocab_parallel_embedding.py": (
+        "num_added_embeddings",
+        "tp_size",
+        "shard_indices",
+        "org_vocab_start_index",
+        "org_vocab_size",
+    ),
     "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridPoolView",
         "cache",
@@ -61,8 +75,12 @@ SGLANG_READS = {
         "state",
         "storage_dtype",
         "temporal",
+        "write_shard_size",
+        "write_shard_rank",
     ),
     "srt/runtime_context.py": ("get_parallel",),
+    "srt/models/deepseek_v2.py": ("q_b_proj_qrep_weight", "w_kc_qrep"),
+    "srt/model_executor/model_runner.py": ("_prepare_replicated_q_proj",),
 }
 
 
@@ -198,6 +216,12 @@ def _owned_resource_inventory(root: Any, model: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen_objects: set[int] = set()
     seen_storages: set[int] = set()
+    # Embedding and DCP borrow established framework collectives. Their retained
+    # coordinators/process groups and communicator buffers are not plugin-owned.
+    external_owners = {
+        id(getattr(getattr(root, "embedding", None), "group", None)),
+        *(id(getattr(box, "group", None)) for box in root.boxes.values()),
+    }
 
     def visit(
         value: Any, name: str, depth: int = 0, forced_kind: str | None = None
@@ -228,7 +252,7 @@ def _owned_resource_inventory(root: Any, model: Any) -> list[dict[str, Any]]:
         if value is None or isinstance(value, (str, bytes, int, float, bool, type)):
             return
         identity = id(value)
-        if identity in model_modules:
+        if identity in model_modules or identity in external_owners:
             return
         if identity in seen_objects:
             return
@@ -310,7 +334,62 @@ def _final_proxy(backbone: Any) -> Any:
     )
 
 
+def _validate_mla_query_shard(attention: Any) -> None:
+    """Keep prepared Q local even when the stock path replicates projection.
+
+    SGLang's replicated-Q preparation adds full-head buffers; it does not
+    replace ``q_b_proj.weight`` or ``w_kc``. The prepared kernels deliberately
+    project these original twelve-head shards and gather the resulting Q once
+    across DCP. The native fallback may independently use its replicas. Never
+    feed a 96-head replica into the fixed 12-head query/value kernels or switch
+    the native configuration to make this path fit.
+    """
+    qb, wk = attention.q_b_proj.weight, attention.w_kc
+    if not isinstance(qb, torch.Tensor) or tuple(qb.shape) != (2304, 1536):
+        raise ValueError(
+            "prepared MLA Q projection needs the original [2304, 1536] shard"
+        )
+    if qb.dtype != torch.bfloat16 or qb.stride() != (1536, 1):
+        raise ValueError("prepared MLA Q projection needs a row-major BF16 shard")
+    if qb.data_ptr() % 16:
+        raise ValueError("prepared MLA Q projection shard is not 16-byte aligned")
+    if not isinstance(wk, torch.Tensor) or wk.dtype != torch.bfloat16:
+        raise ValueError("prepared MLA absorbed Q needs the original BF16 head shard")
+
+    qrep = getattr(attention, "q_b_proj_qrep_weight", None)
+    krep = getattr(attention, "w_kc_qrep", None)
+    if qrep is None and krep is None:
+        # Native preparation may not have run yet, or may retain its own
+        # sharded-Q fallback. This provider never depends on these buffers.
+        return
+    if not isinstance(qrep, torch.Tensor) or not isinstance(krep, torch.Tensor):
+        raise ValueError("native MLA replicated-Q buffers are incomplete")
+    parallel = get_parallel()
+    dcp, rank = int(parallel.attn_dcp_size), int(parallel.attn_dcp_rank)
+    if dcp != 8 or not 0 <= rank < dcp:
+        raise ValueError(
+            "native MLA replicated-Q buffers require the TP8/DCP8 topology"
+        )
+    for replica, shape, source, name in (
+        (qrep, (dcp * 2304, 1536), qb, "Q projection"),
+        (krep, (dcp * 12, 128, 512), wk, "absorbed Q"),
+    ):
+        if (
+            tuple(replica.shape) != shape
+            or replica.dtype != torch.bfloat16
+            or replica.device != source.device
+            or not replica.is_contiguous()
+        ):
+            raise ValueError(f"native MLA replicated {name} has incompatible storage")
+        width = shape[0] // dcp
+        if not torch.equal(replica.narrow(0, rank * width, width), source):
+            raise ValueError(
+                f"native MLA replicated {name} differs from its local shard"
+            )
+
+
 def _mla_proxy(attention: Any) -> tuple[Any, tuple[torch.Tensor, ...]]:
+    _validate_mla_query_shard(attention)
     source_w_uk = attention.w_kc
     if source_w_uk.shape != (12, 128, 512):
         raise ValueError(f"unsupported MLA W_UK_T shape: {source_w_uk.shape}")
@@ -429,6 +508,11 @@ class ResourceSet:
     memory_before: dict[str, int]
     memory_after: dict[str, int]
     deadline_ns: int
+    batches: tuple[int, ...] = _BATCHES
+    native_mla: bool = False
+    full_decode: bool = False
+    prefetch: Any = None
+    embedding: Any = None
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
@@ -476,6 +560,15 @@ class ResourceSet:
             raise ValueError("linear-attention pool mapping is not dense")
 
         page_size = int(hybrid.mla.page_size)
+        if self.native_mla or self.full_decode:
+            first_core = self.attention[full_ids[0]].core
+            if (
+                hybrid.mla.write_shard_size != first_core.kv_shards
+                or hybrid.mla.write_shard_rank != first_core.kv_rank
+            ):
+                raise ValueError(
+                    "Kimi native MLA write-slot topology differs from build"
+                )
         if page_size != 64:
             raise ValueError(f"unsupported MLA page size: {page_size}")
         if hybrid.mla.logical_dtype != torch.float8_e4m3fn:
@@ -587,6 +680,11 @@ class ResourceSet:
             )
 
         binding = {
+            "prepared_batches": list(self.batches),
+            "native_mla": self.native_mla,
+            "full_decode": self.full_decode,
+            "write_shard_size": getattr(hybrid.mla, "write_shard_size", 1),
+            "write_shard_rank": getattr(hybrid.mla, "write_shard_rank", 0),
             # The live serving capacity may shrink after graph capture. The
             # reservation and the tensor identities/layouts are immutable.
             "kv_reserved_capacity": reserved_capacity,
@@ -645,9 +743,20 @@ def build_resources(
     context_length: int,
     memory_before: dict[str, int],
     deadline_ns: int,
+    native_mla: bool = False,
+    full_decode: bool = False,
+    batches: tuple[int, ...] = _BATCHES,
 ) -> ResourceSet:
-    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
+    """Prepare each admitted TP8 token-row width after all-rank consensus."""
 
+    batches = tuple(batches)
+    if not batches or any(
+        type(batch) is not int or batch not in (*_BATCHES, 48) for batch in batches
+    ):
+        raise ValueError("Kimi K3 resources need prepared rows 1-8/16/32/48/64")
+    if 48 in batches and not (native_mla or full_decode):
+        raise ValueError("Kimi K3 Graph48 requires an explicit extended profile")
+    batches = tuple(sorted(set(batches)))
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
@@ -670,6 +779,20 @@ def build_resources(
     group = parallel.tp_group.device_group
     device = next(model.parameters()).device
     owner = (group, device, tp, rank)
+    # All local GPU writes are synchronized by each box before this CPU barrier.
+    # Validate both groups before constructing any mailbox so no partial setup can
+    # enter a barrier with a mismatched rank order or a CUDA-only backend.
+    from .cutedsl.common.host import validate_init_barrier_group
+
+    init_group = validate_init_barrier_group(group, parallel.tp_group.cpu_group)
+    dcp_init_group = None
+    if full_decode and int(parallel.attn_dcp_size) > 1:
+        dcp_init_group = validate_init_barrier_group(
+            parallel.dcp_group.device_group, parallel.dcp_group.cpu_group
+        )
+    init_kwargs = {"init_barrier_group": init_group}
+    if native_mla and full_decode:
+        raise ValueError("K3 native MLA and full decode profiles are exclusive")
     backbone = model.model
     layers = tuple(backbone.layers[backbone.start_layer : backbone.end_layer])
     if len(layers) != 93:
@@ -694,11 +817,13 @@ def build_resources(
             "Kimi layer modules disagree with the configured attention split"
         )
 
-    mailbox = oproj_module.OprojMailbox(*owner)
-    oproj_twoshot = twoshot_module.TwoShot(*owner)
-    front_box = oproj_module.OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
-    small_box = chain_module.SmallBatchBox(*owner)
-    tail_box = tail_module.MoeTailBox(*owner)
+    mailbox = oproj_module.OprojMailbox(*owner, **init_kwargs)
+    oproj_twoshot = twoshot_module.TwoShot(*owner, **init_kwargs)
+    front_box = oproj_module.OprojMailbox(
+        *owner, (1, 64, 3584 + 2 * 896), **init_kwargs
+    )
+    small_box = chain_module.SmallBatchBox(*owner, **init_kwargs)
+    tail_box = tail_module.MoeTailBox(*owner, **init_kwargs)
     boxes = {
         "oproj": mailbox,
         "oproj_twoshot": oproj_twoshot,
@@ -706,7 +831,21 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
-    moe_state = prepared_moe_module.MoEScratch(tp, device, _BATCHES)
+    dcp_box = None
+    if full_decode and int(parallel.attn_dcp_size) > 1:
+        dcp_module = _module("mla.dcp", origins)
+        dcp_box = dcp_module.DcpBox(
+            parallel.dcp_group.device_group,
+            device,
+            int(parallel.attn_dcp_size),
+            int(parallel.attn_dcp_rank),
+            12,
+            interleave=1,
+            deadline_ns=deadline_ns,
+            init_barrier_group=dcp_init_group,
+        )
+        boxes["dcp"] = dcp_box
+    moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
     # an initialization record on its own stream does not alter runtime order.
@@ -741,6 +880,10 @@ def build_resources(
         ),
         "moe": moe_state,
     }
+    if full_decode:
+        scratch["embedding.out"] = torch.empty(
+            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
+        )
     # Explicitly own the side-stream/event lifecycle used by the future executor.
     # Recording the event materializes its CUDA handle without entering a model
     # forward path.
@@ -750,6 +893,19 @@ def build_resources(
     provider_stream.synchronize()
     runtime_handles = {"provider": provider_stream, "ready": provider_ready}
     workspaces: dict[str, torch.Tensor] = {}
+    if full_decode:
+        dcp_module = _module("mla.dcp", origins)
+        # Size every prepared token-row width before the serving KV budget is
+        # computed. DCP processes all ranks' heads over this rank's local shard.
+        heads = 12 if dcp_box is None else 12 * dcp_box.size
+        max_seq = (
+            int(context_length)
+            if dcp_box is None
+            else dcp_module.local_max(int(context_length), dcp_box.size)
+        )
+        workspaces["mla.tokenspeed.workspace"] = dcp_module.prepare_workspace(
+            device, heads, max_seq, batches=batches
+        )
 
     beta = float(backbone.config.activation_situ_beta)
     linear_beta = float(backbone.config.activation_situ_linear_beta)
@@ -776,33 +932,46 @@ def build_resources(
                 {
                     batch: (
                         (64, 64, 2, 5)
-                        if batch == 64
+                        if batch > 32
                         else (64, 32, 2, 8)
-                        if batch == 32
+                        if batch > 16
                         else (64, 16, 2, 10)
-                        if batch == 16
+                        if batch > 8
                         else (64, 8, 4, 8)
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
             ).prepare()
             core = mla_module.PreparedMla(
                 proxy,
-                {batch: 3648 for batch in _BATCHES},
+                {batch: 3648 for batch in batches},
                 scratch["mla.query"],
                 max_context=int(context_length),
-                core="trtllm",
-                dcp=None,
+                core="auto" if full_decode else "trtllm",
+                dcp=dcp_box,
+                parity=full_ids.index(layer_id) % 2,
                 queries=(1,),
+                native_mla=native_mla,
+                kv_shards=int(parallel.attn_dcp_size)
+                if native_mla or full_decode
+                else 1,
+                kv_rank=int(parallel.attn_dcp_rank) if native_mla or full_decode else 0,
+                deadline_ns=deadline_ns if full_decode else 0,
             )
-            if not workspaces:
+            if (
+                "mla.flashinfer.workspace" not in workspaces
+                and not native_mla
+                and dcp_box is None
+            ):
                 workspace, counter = _prepare_mla_workspace(
                     mla_module, device, int(core.heads)
                 )
-                workspaces = {
-                    "mla.flashinfer.workspace": workspace,
-                    "mla.flashinfer.counter": counter,
-                }
+                workspaces.update(
+                    {
+                        "mla.flashinfer.workspace": workspace,
+                        "mla.flashinfer.counter": counter,
+                    }
+                )
             kind = "mla"
         else:
             proxy = _kda_proxy(module)
@@ -817,14 +986,14 @@ def build_resources(
                 {
                     batch: (
                         (64, 64, 1, 6)
-                        if batch == 64
+                        if batch > 32
                         else (128, 32, 2, 5)
-                        if batch == 32
+                        if batch > 16
                         else (128, 16, 2, 6)
-                        if batch == 16
+                        if batch > 8
                         else (128, 8, 2, 6)
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
             ).prepare()
             core = kda_module.PreparedKda(
@@ -832,9 +1001,9 @@ def build_resources(
                 {
                     batch: (
                         6288,
-                        0 if batch in (16, 32, 64) else 1 if batch == 1 else 2,
+                        0 if batch > 8 else 1 if batch == 1 else 2,
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
                 False,
             )
@@ -851,7 +1020,7 @@ def build_resources(
         output = oproj_module.PreparedOproj(
             layer,
             mailbox,
-            _BATCHES,
+            batches,
             is_mla,
             front,
             oproj_twoshot,
@@ -860,17 +1029,33 @@ def build_resources(
         attention[layer_id] = PreparedAttention(
             layer_id, kind, projection_weight, projection, core, output
         )
+        if full_decode:
+            from .skinny_projection import SkinnyProjection
+
+            attention[layer_id].projection = SkinnyProjection(
+                projection_weight, projection
+            ).prepare()
         compilation.extend(
             (
-                {"kind": "projection", "layer_id": layer_id, "name": kind},
-                {"kind": "oproj", "layer_id": layer_id, "name": kind},
+                {
+                    "kind": "projection",
+                    "layer_id": layer_id,
+                    "name": kind,
+                    "batches": list(batches),
+                },
+                {
+                    "kind": "oproj",
+                    "layer_id": layer_id,
+                    "name": kind,
+                    "batches": list(batches),
+                },
             )
         )
 
         if not layer._is_moe_layer:
             feed_forward[layer_id] = dense_module.PreparedDenseMLP(
                 layer.mlp,
-                _BATCHES,
+                batches,
                 reduce=tensor_model_parallel_all_reduce,
             )
             compilation.append(
@@ -886,6 +1071,11 @@ def build_resources(
             routed.w2_weight_scale,
             beta=beta,
             linear_beta=linear_beta,
+            resident_sms=(
+                torch.cuda.get_device_properties(device).multi_processor_count
+                if native_mla or full_decode
+                else None
+            ),
         )
         op = SimpleNamespace(
             rank=rank,
@@ -898,7 +1088,7 @@ def build_resources(
             op,
             layer.mlp.routed_expert_norm.weight,
             layer.mlp.routed_expert_up_proj.weight,
-            _BATCHES,
+            batches,
             (tail_box, ordinal, len(moe_layers)),
             deadline_ns=deadline_ns,
         )
@@ -922,7 +1112,7 @@ def build_resources(
             packed_front,
             front_box,
             moe_state.front,
-            _BATCHES,
+            batches,
             beta,
             linear_beta,
             plan=moe_state.plan,
@@ -957,17 +1147,53 @@ def build_resources(
                 {
                     "kind": "moe_front",
                     "layer_id": layer_id,
-                    "name": "b1_b8_b16_b32_b64",
+                    "name": "prepared_rows",
+                    "batches": list(batches),
                 },
-                {"kind": "moe_tail", "layer_id": layer_id, "name": "b1_b8_b16_b32_b64"},
+                {
+                    "kind": "moe_tail",
+                    "layer_id": layer_id,
+                    "name": "prepared_rows",
+                    "batches": list(batches),
+                },
                 {"kind": "moe_small_batch", "layer_id": layer_id, "name": "b1"},
                 {
                     "kind": "moe_prepared",
                     "layer_id": layer_id,
-                    "name": "b2_b8_b16_b32_b64",
+                    "name": "prepared_rows",
+                    "batches": list(batches),
                 },
             )
         )
+
+    prefetch = embedding = None
+    if full_decode:
+        from .prefetch import PrefetchController
+
+        prefetch = PrefetchController(
+            SimpleNamespace(device=device, tp=tp), layers, moe_front_weights, attention
+        )
+        for layer_id, provider in feed_forward.items():
+            if not layers[layer_id]._is_moe_layer:
+                continue
+            provider.prefetch = prefetch
+            provider.small_batch.prefetch = prefetch
+        embed_module = backbone.embed_tokens
+        indices = embed_module.shard_indices
+        if (
+            embed_module.num_added_embeddings != 0
+            or embed_module.tp_size != tp
+            or indices.org_vocab_start_index != rank * embed_module.weight.shape[0]
+        ):
+            raise ValueError(
+                "K3 prepared embedding requires ordinary contiguous TP shards"
+            )
+        embedding_module = _module("common.embedding", origins)
+        embedding = embedding_module.PreparedEmbedding(embed_module, tp, rank)
+        compilation.append(
+            {"kind": "embedding", "name": "local_gather_native_tp_reduce"}
+        )
+        compilation.append({"kind": "prefetch", "name": "vllm_tp8_weight_overlap"})
 
     before = {
         int(layer.layer_idx): attnres_module.PreparedAttnRes.for_target(
@@ -1012,6 +1238,11 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        batches=batches,
+        native_mla=native_mla,
+        full_decode=full_decode,
+        prefetch=prefetch,
+        embedding=embedding,
     )
     resources.refresh_inventory()
     return resources

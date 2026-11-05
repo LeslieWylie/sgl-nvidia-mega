@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""TP8/B1-B8/B16/B32/B64 captured-decode executor for Kimi K3."""
+"""TP8 prepared-width captured-decode executor for Kimi K3."""
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ SGLANG_READS = {
         "state_indices",
         "track_decode_state",
         "write_slots",
+        "native_decode",
+        "prepare_layer",
+        "global_sequence_lengths",
     ),
 }
 
@@ -153,8 +156,12 @@ class KimiK3MegakernelExecutor:
             )
         mla_slots = view.mla.write_slots
         kda_slots = view.kda.state_indices
+        prepare_layer = getattr(view, "prepare_layer", None)
+        global_lengths = getattr(view.mla, "global_sequence_lengths", None)
         batch = int(input_ids.shape[0])
-        if batch not in (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64):
+        if batch not in getattr(
+            resources, "batches", (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
+        ):
             raise RuntimeError(f"unsupported Kimi K3 megakernel batch: {batch}")
         device = resources.scratch["hidden.0"].device
         _validate_step_inputs(
@@ -169,9 +176,23 @@ class KimiK3MegakernelExecutor:
                 raise RuntimeError(f"MLA cache for layer {layer_id} is not bound")
             if attention.kind == "kda" and attention.caches is None:
                 raise RuntimeError(f"KDA caches for layer {layer_id} are not bound")
+        if getattr(resources, "native_mla", False) and (
+            getattr(view.mla, "native_decode", None) is None or prepare_layer is None
+        ):
+            raise RuntimeError("Kimi native MLA profile requires native runtime hooks")
+        if getattr(resources, "full_decode", False) and prepare_layer is None:
+            raise RuntimeError(
+                "Kimi full decode profile requires restore lifecycle hooks"
+            )
+        if "dcp" in getattr(resources, "boxes", {}) and global_lengths is None:
+            raise RuntimeError("Kimi full DCP requires global sequence lengths")
+        embedding = getattr(resources, "embedding", None)
+        prefetch = getattr(resources, "prefetch", None)
         x = (
             inputs_embeds
             if inputs_embeds is not None
+            else embedding.run(input_ids, resources.scratch["embedding.out"][:batch])
+            if embedding is not None
             else resources.model.model.embed_tokens(input_ids)
         )
         if tuple(x.shape) != (batch, 7168):
@@ -189,44 +210,71 @@ class KimiK3MegakernelExecutor:
         hidden = x
         next_input_ready = False
         last_layer_id = -1
-        for layer in resources.layers:
-            layer_id = int(layer.layer_idx)
-            last_layer_id = layer_id
+        try:
+            for layer in resources.layers:
+                layer_id = int(layer.layer_idx)
+                last_layer_id = layer_id
+                if not next_input_ready:
+                    resources.before[layer_id].run(hidden, prefix, blocks, first)
+
+                if prepare_layer is not None:
+                    prepare_layer(layer_id)
+
+                attention = resources.attention[layer_id]
+                projected = mla_projected if attention.kind == "mla" else kda_projected
+                projected = attention.projection.run(first, projected)
+                if attention.kind == "mla":
+                    native_args = (
+                        {"native_decode": partial(view.mla.native_decode, layer_id)}
+                        if getattr(attention.core, "native_mla", False)
+                        else {}
+                    )
+                    attention.core.run(
+                        projected,
+                        local,
+                        cache=attention.cache,
+                        slots=mla_slots,
+                        block_table=view.mla.block_table,
+                        lengths=(
+                            global_lengths
+                            if getattr(attention.core, "native_mla", False)
+                            and global_lengths is not None
+                            else view.mla.sequence_lengths
+                        ),
+                        totals=global_lengths,
+                        **native_args,
+                    )
+                    if prefetch is not None:
+                        prefetch.fork("attention_moe", layer_id, batch)
+                else:
+                    if prefetch is not None:
+                        prefetch.fork("attention_moe", layer_id, batch)
+                    attention.core.run(
+                        projected, local, caches=attention.caches, slots=kda_slots
+                    )
+                    view.kda.track_decode_state(layer_id)
+                attention.output.run(local, prefix, blocks, second)
+                if prefetch is not None:
+                    prefetch.fork("oproj_down", layer_id, batch)
+
+                consumer = resources.fused_before.get(layer_id)
+                next_input_ready = consumer is not None
+                feed_forward = resources.feed_forward[layer_id]
+                if consumer is not None:
+                    target = output if consumer is resources.final else first
+                    consume = partial(consumer.run_ring, prefix, blocks)
+                    hidden = feed_forward.run(second, target, consume=consume)
+                else:
+                    hidden = feed_forward.run(second, first)
+                    first, second = second, first
+
             if not next_input_ready:
-                resources.before[layer_id].run(hidden, prefix, blocks, first)
-
-            attention = resources.attention[layer_id]
-            projected = mla_projected if attention.kind == "mla" else kda_projected
-            attention.projection.run(first, projected)
-            if attention.kind == "mla":
-                attention.core.run(
-                    projected,
-                    local,
-                    cache=attention.cache,
-                    slots=mla_slots,
-                    block_table=view.mla.block_table,
-                    lengths=view.mla.sequence_lengths,
+                resources.final.run(hidden, prefix, blocks, output)
+            if last_layer_id != 92:
+                raise RuntimeError(
+                    f"Kimi K3 megakernel stopped at layer {last_layer_id}"
                 )
-            else:
-                attention.core.run(
-                    projected, local, caches=attention.caches, slots=kda_slots
-                )
-                view.kda.track_decode_state(layer_id)
-            attention.output.run(local, prefix, blocks, second)
-
-            consumer = resources.fused_before.get(layer_id)
-            next_input_ready = consumer is not None
-            feed_forward = resources.feed_forward[layer_id]
-            if consumer is not None:
-                target = output if consumer is resources.final else first
-                consume = partial(consumer.run_ring, prefix, blocks)
-                hidden = feed_forward.run(second, target, consume=consume)
-            else:
-                hidden = feed_forward.run(second, first)
-                first, second = second, first
-
-        if not next_input_ready:
-            resources.final.run(hidden, prefix, blocks, output)
-        if last_layer_id != 92:
-            raise RuntimeError(f"Kimi K3 megakernel stopped at layer {last_layer_id}")
-        return output
+            return output
+        finally:
+            if prefetch is not None:
+                prefetch.join()

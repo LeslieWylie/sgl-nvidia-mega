@@ -5,7 +5,7 @@ Static weights load before the PDL wait; current-token data is consumed after it
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int64
+from cutlass import BFloat16, Float32, Int32, Int64
 
 from ..common.primitives import (
     alloc,
@@ -35,6 +35,8 @@ from ..common.primitives import (
     unpack_bf16,
     view,
     wait,
+    wait_deadline_check,
+    wait_deadline_start,
     warp_sum,
     zeros,
 )
@@ -44,6 +46,17 @@ KP = 1536 + 32  # padded Q_B / x row (elements): 3136 B, conflict-free 16 B frag
 # its 16-request tiles beat FP32 FMAs from B4 at 12 heads and from B6 at 6 heads.
 TILED_FROM = {12: 4, 6: 6}
 Q_SENT = 0xFFFFFFFF  # q mailbox sentinel: four FP8 0xFF bytes, never written
+
+
+def _require_deadline_ns(deadline_ns):
+    """Remote DCP waits must retain the serving framework's finite deadline."""
+    if (
+        isinstance(deadline_ns, bool)
+        or not isinstance(deadline_ns, int)
+        or not 0 < deadline_ns <= (1 << 63) - 1
+    ):
+        raise ValueError("Kimi DCP requires a finite positive int64 deadline_ns")
+    return deadline_ns
 
 
 class MlaQuery:
@@ -65,14 +78,33 @@ class MlaQuery:
         *,
         q_b_cp_async: bool = False,
         dcp: int = 0,
+        kv_shards: int = 1,
+        kv_rank: int = 0,
+        deadline_ns: int = 0,
     ):
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
         self.dcp = dcp
+        self.deadline_ns = _require_deadline_ns(deadline_ns) if dcp else 0
+        if dcp and (
+            dcp not in (8, 16)
+            or dcp * heads != 96
+            or kv_shards != dcp
+            or not 0 <= kv_rank < dcp
+            or not 1 <= batch <= 64
+        ):
+            raise ValueError(
+                "Kimi DCP query differs from token-striped mailbox geometry"
+            )
+        self.kv_shards, self.kv_rank = kv_shards, kv_rank
         self.cluster = 16 if heads == 6 and not self.wide else 8
         self.rows, self.latent = 192 // self.cluster, 512 // self.cluster
         self.groups, self.p_per_group = 256 // self.latent, self.latent // 2
-        self.tokens = 1 if batch == 2 else min(batch, 8)
+        # DCP CTAs poll every rank's whole query mailbox, so both rows must
+        # publish in one resident wave: 8 parts * 12 heads = 96 CTAs, rather
+        # than two 96-CTA tiles on a 148-SM device. The small-batch kernel's
+        # existing per-token loops also serve B2; non-DCP keeps its old split.
+        self.tokens = 1 if batch == 2 and not dcp else min(batch, 8)
         if self.wide:
             self.tokens = 16 if batch <= 16 else 32 if batch <= 32 or heads < 8 else 64
         self.grid = (self.cluster, heads, (batch + self.tokens - 1) // self.tokens)
@@ -137,7 +169,11 @@ class MlaQuery:
             loads = [load_volatile(source, count=4) for source in sources]
             for i in cutlass.range_constexpr(n):  # the loads above are in flight
                 words = loads[i]
+                started, polls = Int64(0), Int32(0)
+                if not published(words, sentinel=Q_SENT):
+                    started = wait_deadline_start(self.deadline_ns)
                 while not published(words, sentinel=Q_SENT):
+                    polls = wait_deadline_check(started, polls, self.deadline_ns)
                     words = load_volatile(sources[i], count=4)
 
     @cute.kernel
@@ -285,6 +321,13 @@ class MlaQuery:
         slot = cutlass.Int64(-1)
         if valid:
             slot = slots[tok0 + j]
+        if cutlass.const_expr(self.kv_shards > 1):
+            # SGLang physical write ids still span the DCP ranks. Only the
+            # owner inserts; collapse its id into the rank-local storage row.
+            if (slot >= 0) & (slot % self.kv_shards == self.kv_rank):
+                slot = slot // self.kv_shards
+            else:
+                slot = cutlass.Int64(-1)
         if slot >= 0:
             ksi = k_scale_inv[0]
             xx = cute.make_rmem_tensor(8, Float32)

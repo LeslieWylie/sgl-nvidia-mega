@@ -137,6 +137,10 @@ PINNED_TOLERATED = {
         "ForwardView.low_ratio_sources",
         "ForwardView.core_compressor",
         "KdaStepView.track_decode_state",
+        "HybridStepView.prepare_layer",
+        "MlaStepView.native_decode",
+        "megakernel_agree",
+        "MegakernelBinding.native_mla_supports_backend",
         "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",
         "KvPoolView.pool",
         "sglang.kernels.ops",
@@ -175,8 +179,18 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
     callables = {
         name.split(".", 1)[1]
         for name in PINNED_TOLERATED["TOLERATED_CALLABLES"]
-        if name.startswith(("ForwardView.", "KdaStepView.", "KvPoolView."))
+        if name.startswith(
+            (
+                "ForwardView.",
+                "KdaStepView.",
+                "KvPoolView.",
+                "HybridStepView.",
+                "MlaStepView.",
+                "MegakernelBinding.",
+            )
+        )
     }
+    callables.add("megakernel_agree")
     data = {
         "ForwardView",
         "HybridPoolView",
@@ -207,6 +221,9 @@ def test_every_binding_callable_the_plugin_reads_is_tolerated():
         "uniform_fp8",
         "request_window",
         "write_slots",
+        "write_shard_size",
+        "write_shard_rank",
+        "global_sequence_lengths",
         "forward_view",
         "engram_history",
         "engram_host_table",

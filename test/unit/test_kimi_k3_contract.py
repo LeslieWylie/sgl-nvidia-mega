@@ -52,10 +52,14 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     )
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-# Frozen payload shipped in a0a97a0 (#17); host integration changes must not
-# alter these 43 kernel files.
-FROZEN_PAYLOAD_SHA256 = (
+# Baseline payload shipped in a0a97a0 (#17). This branch changes the query's
+# DCP slot mapping, prepared native callback and SM-bounded expert schedule.
+# Historical GPU evidence does not qualify this candidate payload.
+BASELINE_PAYLOAD_SHA256 = (
     "317036ce5d069f1eb68ac110032d7a7f310ad78e2565fd605ed04e968c2aa82a"
+)
+CANDIDATE_PAYLOAD_SHA256 = (
+    "8165469229e6beee40acb6ee809f81bf8ca23a23b10fad09510b2aa27e940bdd"
 )
 
 
@@ -255,7 +259,36 @@ class TestKimiK3Contract(unittest.TestCase):
         language_model = SimpleNamespace(
             model=SimpleNamespace(layers=layers),
             config=SimpleNamespace(
-                full_attention_layer_ids=full_ids, linear_layer_ids=linear_ids
+                full_attention_layer_ids=full_ids,
+                linear_layer_ids=linear_ids,
+                hidden_size=7168,
+                num_hidden_layers=93,
+                num_attention_heads=96,
+                q_lora_rank=1536,
+                kv_lora_rank=512,
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                v_head_dim=128,
+                mla_use_nope=True,
+                mla_use_output_gate=True,
+                hidden_act="situ",
+                n_routed_experts=896,
+                num_experts=896,
+                num_experts_per_token=16,
+                num_expert_group=1,
+                topk_group=1,
+                moe_router_activation_func="sigmoid",
+                routed_expert_hidden_size=3584,
+                moe_intermediate_size=3072,
+                num_shared_experts=2,
+                latent_moe_use_norm=True,
+                attn_res_block_size=12,
+                linear_attn_config={
+                    "num_heads": 96,
+                    "head_dim": 128,
+                    "short_conv_kernel_size": 4,
+                    "use_full_rank_gate": True,
+                },
             ),
         )
         model = SimpleNamespace(language_model=language_model)
@@ -265,7 +298,7 @@ class TestKimiK3Contract(unittest.TestCase):
             any("93-layer" in reason for reason in _model_disable_reasons(model, None))
         )
 
-    def test_frozen_payload_inventory_and_digest(self):
+    def test_candidate_payload_inventory_and_digest(self):
         import sgl_nvidia_mega
 
         package_root = Path(sgl_nvidia_mega.__file__).resolve().parent
@@ -279,7 +312,7 @@ class TestKimiK3Contract(unittest.TestCase):
             digest.update(relative.encode() + b"\0")
             digest.update(str(len(content)).encode() + b"\0")
             digest.update(hashlib.sha256(content).digest())
-        self.assertEqual(digest.hexdigest(), FROZEN_PAYLOAD_SHA256)
+        self.assertEqual(digest.hexdigest(), CANDIDATE_PAYLOAD_SHA256)
 
 
 class _PreparedCore:
@@ -454,9 +487,21 @@ class _RecordingCore(_NoOp):
 
 class TestKimiK3TypedStep(unittest.TestCase):
     def test_executor_uses_only_the_typed_step_and_tracks_every_kda_layer(self):
+        for native in (False, True):
+            with self.subTest(native=native):
+                self._exercise_executor(native)
+
+    def test_graph48_dispatches_every_layer_with_prepared_native_or_full_resources(
+        self,
+    ):
+        for native in (False, True):
+            with self.subTest(native=native):
+                self._exercise_executor(native, batch=48)
+
+    def _exercise_executor(self, native, batch=1):
         from sgl_nvidia_mega.kimi_k3.executor import KimiK3MegakernelExecutor
 
-        batch, width = 1, 7168
+        width = 7168
         scratch = {
             "prefix": torch.zeros(batch, 1),
             "blocks": torch.zeros(batch, 1),
@@ -469,9 +514,10 @@ class TestKimiK3TypedStep(unittest.TestCase):
         }
         layers = tuple(SimpleNamespace(layer_idx=index) for index in range(93))
         mla_cache, mla_core = torch.zeros(1), _RecordingCore()
+        mla_core.native_mla = native
         attention = {}
         for index in range(93):
-            is_mla = index == 0
+            is_mla = index % 4 == 0
             attention[index] = SimpleNamespace(
                 kind="mla" if is_mla else "kda",
                 projection=_NoOp(),
@@ -482,6 +528,9 @@ class TestKimiK3TypedStep(unittest.TestCase):
             )
         resources = SimpleNamespace(
             binding_fingerprint="bound",
+            batches=(batch,),
+            native_mla=native,
+            full_decode=batch == 48 and not native,
             model=SimpleNamespace(model=SimpleNamespace(embed_tokens=Mock())),
             layers=layers,
             attention=attention,
@@ -492,16 +541,24 @@ class TestKimiK3TypedStep(unittest.TestCase):
             final=_NoOp(),
         )
         tracked = []
+        prepared = []
         view = HybridStepView(
             mla=MlaStepView(
                 block_table=torch.zeros(batch, 1, dtype=torch.int32),
-                sequence_lengths=torch.ones(batch, dtype=torch.int32),
+                sequence_lengths=torch.full(
+                    (batch,), 0 if native else 1, dtype=torch.int32
+                ),
+                global_sequence_lengths=torch.ones(batch, dtype=torch.int32)
+                if native
+                else None,
+                native_decode=Mock() if native else None,
                 write_slots=torch.zeros(batch, dtype=torch.int64),
             ),
             kda=KdaStepView(
                 state_indices=torch.zeros(batch, dtype=torch.int32),
                 track_decode_state=tracked.append,
             ),
+            prepare_layer=prepared.append if native or batch == 48 else None,
         )
         with patch("sgl_nvidia_mega.kimi_k3.executor._validate_step_inputs"):
             result = KimiK3MegakernelExecutor(resources).run(
@@ -509,11 +566,19 @@ class TestKimiK3TypedStep(unittest.TestCase):
             )
         self.assertEqual(result.data_ptr(), scratch["hidden.out"].data_ptr())
         self.assertEqual(tuple(result.shape), (batch, width))
-        self.assertEqual(tracked, list(range(1, 93)))
+        self.assertEqual(tracked, [index for index in range(93) if index % 4])
         self.assertIs(mla_core.kwargs["cache"], mla_cache)
         self.assertIs(mla_core.kwargs["slots"], view.mla.write_slots)
         self.assertIs(mla_core.kwargs["block_table"], view.mla.block_table)
-        self.assertIs(mla_core.kwargs["lengths"], view.mla.sequence_lengths)
+        self.assertIs(
+            mla_core.kwargs["lengths"],
+            view.mla.global_sequence_lengths if native else view.mla.sequence_lengths,
+        )
+        if native or batch == 48:
+            self.assertEqual(prepared, list(range(93)))
+        if native:
+            mla_core.kwargs["native_decode"]("query", "output")
+            view.mla.native_decode.assert_called_once_with(92, "query", "output")
         resources.model.model.embed_tokens.assert_not_called()
 
 

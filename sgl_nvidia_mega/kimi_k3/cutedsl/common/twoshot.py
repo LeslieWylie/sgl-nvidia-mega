@@ -26,6 +26,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 
+from .host import validate_init_barrier_group
 from .mailbox import rearm
 from .primitives import (
     add_rn,
@@ -49,7 +50,19 @@ class TwoShot:
     columns, one slot per source rank), ``gather`` [1, cap, width] (multicast) and the
     ranks' ``recv`` base addresses [parity, TP]."""
 
-    def __init__(self, group, device, tp, rank, width=7168, cap=64, parities=2):
+    def __init__(
+        self,
+        group,
+        device,
+        tp,
+        rank,
+        width=7168,
+        cap=64,
+        parities=2,
+        *,
+        init_barrier_group=None,
+    ):
+        init_group = validate_init_barrier_group(group, init_barrier_group)
         self.tp, self.rank, self.width = tp, rank, width
         shape = (parities, tp, cap, width // tp)
         bf16 = dict(dtype=torch.bfloat16, device=device)
@@ -66,7 +79,7 @@ class TwoShot:
         for t in (self.recv, self.gather):
             t.view(torch.int32).fill_(SENTINEL)
         torch.accelerator.synchronize(device)
-        torch.distributed.barrier(group=group)
+        torch.distributed.barrier(group=init_group)
 
     def views(self, parity):
         """(recv, peers, gather, gather multicast address) of layer parity."""

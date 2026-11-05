@@ -8,21 +8,32 @@ runs over the local KV shard for every DCP rank's heads between the query's q
 publication and ``DcpValue``'s merge (see mla.dcp). Spec verify: ``q`` query tokens
 per request (rows grouped by request, causal among them)."""
 
+import math
 from functools import cache
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, layout, prepare_shared_carveout, stream, to_cute
+from ..common.host import (
+    _checked,
+    check_residency,
+    fake,
+    layout,
+    prepare_shared_carveout,
+    resolve_kernel,
+    stream,
+    to_cute,
+)
 from .dcp import (
     compile_value,
     fill_splits,
     local_max,
     stock_decode,
 )
-from .query import MlaQuery
+from .query import MlaQuery, _require_deadline_ns
 from .value import MlaValue
 
 # tokenspeed (SM-filling splits) streams long contexts fast; trtllm-gen wins from B16.
@@ -30,8 +41,57 @@ TRTLLM_CORE_BATCH, CORES = 16, ("tokenspeed", "trtllm")
 _FLASHINFER: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+def _check_dcp_query_residency(compiled, query, device):
+    """Reject a polling grid that cannot fit as CTAs and as thread-block clusters.
+
+    Driver occupancy is a necessary capacity bound; a GPU run must still qualify
+    cross-rank progress and the launcher's actual scheduling behavior.
+    """
+    blocks = math.prod(query.grid)
+    check_residency(compiled, device, blocks, 256, "Kimi DCP query")
+    _, function = resolve_kernel(compiled, device)
+    (smem,) = _checked(
+        cuda.cuFuncGetAttribute(
+            cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            function,
+        )
+    )
+    config = cuda.CUlaunchConfig()
+    config.gridDimX, config.gridDimY, config.gridDimZ = query.grid
+    config.blockDimX, config.blockDimY, config.blockDimZ = 256, 1, 1
+    config.sharedMemBytes = smem
+    config.hStream = stream(device)
+    cluster = cuda.CUlaunchAttribute()
+    cluster.id = cuda.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+    cluster.value.clusterDim.x = query.cluster
+    cluster.value.clusterDim.y = cluster.value.clusterDim.z = 1
+    config.attrs, config.numAttrs = [cluster], 1
+    (capacity,) = _checked(
+        cuda.cuOccupancyMaxActiveClusters(function, config),
+        "cuOccupancyMaxActiveClusters for Kimi DCP query",
+    )
+    required = blocks // query.cluster
+    if required > capacity:
+        raise RuntimeError(
+            f"Kimi DCP query: {required} clusters cannot be co-resident "
+            f"({capacity} fit)"
+        )
+
+
 @cache
-def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
+def compile_core(
+    batch,
+    heads,
+    pitch,
+    specs,
+    device,
+    dcp=0,
+    sms=148,
+    q=1,
+    kv_shards=1,
+    kv_rank=0,
+    deadline_ns=0,
+):
     """CuTe kernels (query, value) of one batch of rows (``q`` per request); under DCP
     (``dcp``: its size) the query publishes and the value is DcpValue."""
     qnorm, kvnorm, qb, uk, uv, qinv, kinv, kv = (
@@ -47,20 +107,43 @@ def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
     latent = fake((batch, heads, 512))
     f32, s = cutlass.Float32, make_fake_stream()
     cp_async = heads == 12 and batch == 1
-    mla_query = MlaQuery(heads, batch, q_b_cp_async=cp_async, dcp=dcp)
+    mla_query = MlaQuery(
+        heads,
+        batch,
+        q_b_cp_async=cp_async,
+        dcp=dcp,
+        kv_shards=kv_shards,
+        kv_rank=kv_rank,
+        deadline_ns=deadline_ns,
+    )
     q_args: tuple = (projected, qnorm, kvnorm, qb, uk, kv, slots, qinv, kinv)
     q_args += (f32(1e-6), query)
     if dcp:  # this parity's q mailbox, its multicast address, rank
         mailbox = fake((64, dcp * heads, 576), None, torch.uint8)
         q_args += (mailbox, cutlass.Int64(0), cutlass.Int32(0))
     with torch.accelerator.device_index(device):
-        kernels = [cute.compile(mla_query, *q_args, s)]
+        query_kernel = cute.compile(mla_query, *q_args, s)
+        query_launch = query_kernel
         if batch > 1:
-            kernels = [prepare_shared_carveout(kernels[0], device, 100)]
+            query_launch = prepare_shared_carveout(query_kernel, device, 100)
+        if dcp:
+            _check_dcp_query_residency(query_kernel, mla_query, device)
+        kernels = [query_launch]
         if dcp:
             uv_spec = specs[4]
             kernels.append(
-                compile_value(heads, dcp, batch, 64, uv_spec, pitch, device, sms, q)
+                compile_value(
+                    heads,
+                    dcp,
+                    batch,
+                    64,
+                    uv_spec,
+                    pitch,
+                    device,
+                    sms,
+                    q,
+                    deadline_ns=deadline_ns,
+                )
             )
         else:
             v_args = (latent, uv, gate, lengths, output, s)
@@ -147,12 +230,44 @@ class PreparedMla:
         dcp=None,
         parity=0,
         queries=(1,),
+        native_mla=False,
+        kv_shards=1,
+        kv_rank=0,
+        deadline_ns=0,
     ):
         self.heads = attention.W_UK_T.shape[0]
+        allowed_shards = (1, 8) if native_mla else (1, 8, 16)
+        if kv_shards not in allowed_shards or not 0 <= kv_rank < kv_shards:
+            raise ValueError("Kimi MLA has unsupported KV shard/rank geometry")
+        if native_mla and (dcp is not None or tuple(queries) != (1,)):
+            raise ValueError("Kimi native MLA serves ordinary decode without DcpBox")
+        self.native_mla = native_mla
+        self.kv_shards, self.kv_rank = kv_shards, kv_rank
+        self.deadline_ns = 0
+        if dcp is not None:
+            self.deadline_ns = _require_deadline_ns(
+                dcp.deadline_ns if deadline_ns == 0 else deadline_ns
+            )
+            if self.deadline_ns != dcp.deadline_ns:
+                raise ValueError("Kimi DCP provider and mailbox deadlines differ")
+            if (
+                kv_shards != dcp.size
+                or kv_rank != dcp.rank
+                or self.heads != dcp.heads
+                or dcp.cap != 64
+                or parity not in (0, 1)
+                or not pitches
+                or max(pitches) > dcp.cap
+            ):
+                raise ValueError(
+                    "Kimi DCP provider differs from its mailbox topology/capacity"
+                )
         norms = attention.q_a_layernorm.weight, attention.kv_a_layernorm.weight
         self.weights: tuple = (*norms, attention.q_b_proj.weight, attention.W_UK_T)
         self.weights += (attention.W_UV, attention._q_scale_inv, attention._k_scale_inv)
         self.device, self.pitches = attention.q_b_proj.weight.device, pitches
+        if dcp is not None and dcp.q.device != self.device:
+            raise ValueError("Kimi DCP provider and mailbox devices differ")
         k_scale = attention._k_scale_float
         softmax = attention.scale * attention._q_scale_float * k_scale
         self.eps = cutlass.Float32(attention.rms_norm_eps)
@@ -179,13 +294,25 @@ class PreparedMla:
             dcp = self.dcp.size if self.dcp is not None else 0
             sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             pitch = self.pitches[batch]
-            args = batch, self.heads, pitch, specs, device, dcp, sms, q
+            args = (
+                batch,
+                self.heads,
+                pitch,
+                specs,
+                device,
+                dcp,
+                sms,
+                q,
+                self.kv_shards,
+                self.kv_rank,
+                self.deadline_ns,
+            )
             query = to_cute(self.query_scratch[:batch])
             latent = to_cute(self.latent[:batch])
             self.kernels[batch, q] = (*compile_core(*args), query, latent)
             if self.dcp is not None:
                 self.prepare_dcp(batch)
-            if kv.is_cuda:  # compile before graph capture
+            if kv.is_cuda and not self.native_mla:  # compile before graph capture
                 table = torch.zeros(batch, 1, dtype=torch.int32, device=kv.device)
                 ones = torch.full((batch,), q, dtype=torch.int32, device=kv.device)
                 self.stock_core(kv, table, ones, batch, q, ones)
@@ -226,14 +353,36 @@ class PreparedMla:
         stock_decode(query, *args, self.stock_scales, out, lse, split, **cp)
 
     def run(
-        self, projected, out, *, cache, slots, block_table, lengths, totals=None, q=1
+        self,
+        projected,
+        out,
+        *,
+        cache,
+        slots,
+        block_table,
+        lengths,
+        totals=None,
+        q=1,
+        native_decode=None,
     ):
         """``lengths``/``block_table``: this rank's KV (the local shard under DCP);
         ``totals``: under DCP, the requests' full lengths. ``q`` rows per request (spec
         verify; ``slots`` per row). Rows of ``projected`` beyond the requests run as
         empty requests (zero output)."""
         batch, s = projected.shape[0], stream(self.device)
+        if self.native_mla and native_decode is None:
+            raise RuntimeError("Kimi native MLA step has no SGLang attention adapter")
         reqs = batch // q
+        if self.dcp is not None and (
+            totals is None
+            or totals.dtype != torch.int32
+            or totals.ndim != 1
+            or totals.shape[0] < min(reqs, block_table.shape[0], lengths.shape[0])
+            or totals.device != self.device
+        ):
+            raise ValueError(
+                "Kimi DCP requires global int32 lengths before query publication"
+            )
         block_table, lengths, totals = pad_requests(reqs, block_table, lengths, totals)
         kv = to_cute(cache.view(torch.uint8))
         mq, v, query, latent = self.kernels[batch, q]
@@ -242,7 +391,12 @@ class PreparedMla:
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, qinv, kinv, self.eps, query)
         out_view, gate = to_cute(out), to_cute(projected[:, 2112:])
         lens = to_cute(lengths[:reqs], 4)
-        if self.dcp is not None:  # DcpValue zeroes padded requests (global lengths)
+        if self.native_mla:
+            mq(*q_args, s)
+            native_decode(self.query_scratch[:batch], self.latent[:batch])
+            v(latent, uv, gate, lens, out_view, s)
+            return out
+        elif self.dcp is not None:  # DcpValue zeroes padded requests (global lengths)
             publish, ((rows, rows_lse), boxes, peers), ids = self.dcp_args[batch]
             mq(*q_args, *publish, s)
             self.stock_core(cache, block_table, lengths, batch, q, totals)

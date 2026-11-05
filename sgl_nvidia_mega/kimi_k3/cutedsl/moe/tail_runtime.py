@@ -17,7 +17,14 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to_cute
+from ..common.host import (
+    fake,
+    prepare_shared_carveout,
+    stream,
+    tensor_maps,
+    to_cute,
+    validate_init_barrier_group,
+)
 from ..common.policy import batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox
@@ -83,11 +90,17 @@ class MoeTailBox:
     local all-reduced latent rows [3, CAP, 3584] that WaveMoeTail clusters share and the
     two-shot latent buffers (``twoshot_args``/``twoshot_tail`` replace args/tail)."""
 
-    def __init__(self, group, device, tp, rank):
+    def __init__(self, group, device, tp, rank, *, init_barrier_group=None):
+        validate_init_barrier_group(group, init_barrier_group)
+        init_kwargs = {"init_barrier_group": init_barrier_group}
         self.rank = rank
-        self.latent = OprojMailbox(group, device, tp, rank, (3, tp, CAP, 3584))
-        self.rs = OprojMailbox(group, device, tp, rank, (3, tp, CAP, 7168 // tp))
-        self.out = OprojMailbox(group, device, tp, rank, (1, CAP, 7168))
+        self.latent = OprojMailbox(
+            group, device, tp, rank, (3, tp, CAP, 3584), **init_kwargs
+        )
+        self.rs = OprojMailbox(
+            group, device, tp, rank, (3, tp, CAP, 7168 // tp), **init_kwargs
+        )
+        self.out = OprojMailbox(group, device, tp, rank, (1, CAP, 7168), **init_kwargs)
         ptrs = self.rs.handle.buffer_ptrs
         self.peers = torch.tensor(ptrs, dtype=torch.int64, device=device)
         self.args = (flat(self.latent.buffer), flat(self.rs.buffer))
@@ -95,7 +108,9 @@ class MoeTailBox:
         self.tail += (Int64(self.latent.mc), Int64(self.out.mc))
         self.reduced = torch.empty((3, CAP, 3584), dtype=torch.bfloat16, device=device)
         self.reduced.view(torch.int32).fill_(-0x80000000)
-        self.twoshot = box = TwoShot(group, device, tp, rank, 3584, CAP, parities=3)
+        self.twoshot = box = TwoShot(
+            group, device, tp, rank, 3584, CAP, parities=3, **init_kwargs
+        )
         self.twoshot_args = (flat(box.recv), self.args[1])
         self.twoshot_tail = (*self.tail[:2], Int64(box.gather_mc), self.tail[3])
         # Experts' push: every parity's receive slots [3 x TP, CAP, 3584/TP] and the

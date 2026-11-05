@@ -14,6 +14,39 @@ from pathlib import Path
 from typing import Any
 
 _CUTLASS_DSL_VERSION = "4.8.0"
+_TOKENSPEED_DISTRIBUTIONS = {
+    "tokenspeed-mla": "2.0.3",
+    "apache-tvm-ffi": "0.1.11",
+}
+# Keyword arguments used by dcp.stock_decode. The pinned 2.0.3 compiler requires
+# has_local_visible_lens even when no compact-local visibility tensor is used.
+_TOKENSPEED_COMPILE_PARAMETERS = (
+    "torch_dtype",
+    "page_size",
+    "kv_lora_rank",
+    "qk_rope_head_dim",
+    "is_persistent",
+    "is_var_seq",
+    "is_var_split_kv",
+    "compute_capability",
+    "has_local_visible_lens",
+    "skip_correction_threshold",
+    "is_workspace_size_zero",
+    "fold_sq_factor",
+    "causal_mask",
+    "num_heads",
+    "seq_len_q",
+    "window_left",
+    "cp_world",
+    "cp_rank",
+    "cp_interleave_size",
+    "use_pdl",
+    "return_lse",
+    "reducer_d_tiles",
+    "reducer_max_splits",
+    "pack_q",
+    "partial_fp16",
+)
 _FLASHINFER_DISTRIBUTIONS = (
     "flashinfer-python",
     "flashinfer-cubin",
@@ -71,6 +104,154 @@ def _require_files(
     missing = tuple(str(path) for path in paths if not predicate(path))
     if missing:
         raise RuntimeError(f"{label} are absent: {missing}")
+
+
+def _tokenspeed_signature(
+    value: Any,
+    label: str,
+    positional: tuple[str, ...] = (),
+    keywords: tuple[str, ...] = (),
+) -> str:
+    """Check the actual call shape without compiling or executing a GPU API."""
+    if not callable(value):
+        raise RuntimeError(f"Kimi K3 full decode requires callable {label}")
+    try:
+        signature = inspect.signature(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Kimi K3 full decode cannot inspect {label}; reinstall the pinned "
+            "tokenspeed-mla and apache-tvm-ffi wheels"
+        ) from error
+    parameters = signature.parameters
+    missing = tuple(name for name in (*positional, *keywords) if name not in parameters)
+    positional_names = tuple(
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    if missing or positional_names[: len(positional)] != positional:
+        raise RuntimeError(
+            f"Kimi K3 full decode {label} signature is incompatible: {signature}; "
+            f"expected positional {positional} and keywords {keywords} "
+            f"(missing {missing}). Reinstall the pinned tokenspeed-mla and "
+            "apache-tvm-ffi wheels"
+        )
+    try:
+        # bind, rather than bind_partial, also rejects newly required arguments.
+        signature.bind(*([None] * len(positional)), **dict.fromkeys(keywords))
+    except TypeError as error:
+        raise RuntimeError(
+            f"Kimi K3 full decode {label} cannot accept its prepared call: "
+            f"{signature} ({error}). Reinstall the pinned tokenspeed-mla and "
+            "apache-tvm-ffi wheels"
+        ) from error
+    return str(signature)
+
+
+@cache
+def validate_tokenspeed_compatibility() -> str:
+    """Validate full-decode-only private APIs before resource or graph creation.
+
+    Imports remain lazy so the community and native-MLA profiles need neither
+    TokenSpeed nor TVM FFI. No API is invoked and no GPU allocation or compile is
+    performed here. The digest records the accepted version/signature contract.
+    """
+    versions = {}
+    for distribution, expected in _TOKENSPEED_DISTRIBUTIONS.items():
+        try:
+            version = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                f"Kimi K3 full decode requires {distribution}=={expected}, but it "
+                "is not installed. Install the pinned tokenspeed-mla==2.0.3 and "
+                "apache-tvm-ffi==0.1.11 wheels before enabling k3_full_decode"
+            ) from error
+        if version != expected:
+            raise RuntimeError(
+                f"Kimi K3 full decode requires {distribution}=={expected}, found "
+                f"{version}. Install the pinned wheels before enabling k3_full_decode"
+            )
+        versions[distribution] = version
+
+    modules = {}
+    for name in ("tokenspeed_mla", "tokenspeed_mla.mla_decode", "tvm_ffi"):
+        try:
+            modules[name] = importlib.import_module(name)
+        except Exception as error:
+            raise RuntimeError(
+                f"Kimi K3 full decode cannot import {name}; install the pinned "
+                "tokenspeed-mla==2.0.3 and apache-tvm-ffi==0.1.11 wheels with "
+                f"their CUDA runtime dependencies ({type(error).__name__}: {error})"
+            ) from error
+    md = modules["tokenspeed_mla.mla_decode"]
+    contracts = {
+        "tokenspeed_mla.get_num_sm": (
+            modules["tokenspeed_mla"],
+            "get_num_sm",
+            ("device",),
+            (),
+        ),
+        "tvm_ffi.use_torch_stream": (modules["tvm_ffi"], "use_torch_stream", (), ()),
+        "select_mla_decode_tilers": (
+            md,
+            "select_mla_decode_tilers",
+            ("num_heads", "seq_len_q"),
+            ("is_fp8", "compute_capability"),
+        ),
+        "get_mla_decode_fold_sq_factor": (
+            md,
+            "get_mla_decode_fold_sq_factor",
+            ("num_heads", "seq_len_q", "mma_m_tile"),
+            (),
+        ),
+        "compute_q_tile_layout": (
+            md,
+            "compute_q_tile_layout",
+            ("num_heads", "seq_len_q", "m_tile"),
+            (),
+        ),
+        "get_num_sm": (md, "get_num_sm", ("device",), ()),
+        "_get_split_kv_and_workspace_size": (
+            md,
+            "_get_split_kv_and_workspace_size",
+            (
+                "B",
+                "q_len",
+                "H",
+                "kv_lora_rank",
+                "max_active_blocks",
+                "max_seq_len",
+                "torch_dtype",
+                "mma_qk_tiler_mn",
+                "min_split_kv",
+            ),
+            (),
+        ),
+        "_get_compiled_mla_kernel": (
+            md,
+            "_get_compiled_mla_kernel",
+            (),
+            _TOKENSPEED_COMPILE_PARAMETERS,
+        ),
+        "_get_reducer_d_tiles": (
+            md,
+            "_get_reducer_d_tiles",
+            ("batch_size", "seq_len_q", "num_heads", "num_sms", "split_kv"),
+            (),
+        ),
+        "_get_reducer_max_splits": (md, "_get_reducer_max_splits", ("split_kv",), ()),
+    }
+    signatures = {
+        label: _tokenspeed_signature(getattr(module, name, None), label, args, kwargs)
+        for label, (module, name, args, kwargs) in contracts.items()
+    }
+    payload = json.dumps(
+        {"versions": versions, "signatures": signatures},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 @cache

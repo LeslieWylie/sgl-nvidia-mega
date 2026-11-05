@@ -31,3 +31,12 @@ flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at v0.7.0.post1
 FlashInfer
 Copyright 2025-2026 NVIDIA
 Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+Kimi K3's L2 weight-prefetch orchestration in
+sgl_nvidia_mega/kimi_k3/prefetch.py is adapted from vLLM (Apache License 2.0,
+Copyright contributors to the vLLM project), PR #61867:
+https://github.com/vllm-project/vllm/pull/61867
+Comparison revision: 063c0c6d25658ed0702670b2fd07f02f21cadf10.
+The existing Kimi K3 executor and CuTe DSL payload are the SGLang/NVIDIA
+implementation introduced in sgl-project/sgl-nvidia-mega#17; their original
+file-level notices are retained.

@@ -13,16 +13,26 @@ concurrency:
   group: unit-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # Includes the hybrid preparation/views API from sgl-project/sglang#45406.
-  # Pin source until a published nightly contains this interface; updating the
-  # pin is a normal PR and must pass the static mirror/contract tests.
-  SGLANG_COMMIT: aa3e34aaebf880d72482cea74dbbfef54da728e2
-
 jobs:
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Other models keep their existing source pin. K3's additive runtime hooks
+    # use the exact companion revision until it is merged upstream. Do not move
+    # unrelated model mirror digests just to admit the new K3 framework.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: existing-models
+            sglang_repository: sgl-project/sglang
+            sglang_commit: aa3e34aaebf880d72482cea74dbbfef54da728e2
+            pytest_selection: "not kimi and not the_binding_tolerates_exactly_the_pinned_sglang_code and not every_binding_callable_the_plugin_reads_is_tolerated"
+          - suite: kimi-tp8
+            sglang_repository: LeslieWylie/sglang
+            sglang_commit: 243089ecf2b85fe1f6f69d87b73cc20000997380
+            pytest_selection: "kimi or the_binding_tolerates_exactly_the_pinned_sglang_code or every_binding_callable_the_plugin_reads_is_tolerated"
+    name: Unit Test (${{ matrix.suite }})
     steps:
       - uses: actions/checkout@v4
 
@@ -34,8 +44,8 @@ jobs:
       - name: Check out the pinned SGLang source
         uses: actions/checkout@v4
         with:
-          repository: sgl-project/sglang
-          ref: ${{ env.SGLANG_COMMIT }}
+          repository: ${{ matrix.sglang_repository }}
+          ref: ${{ matrix.sglang_commit }}
           path: .ci/sglang
           persist-credentials: false
 
@@ -52,4 +62,6 @@ jobs:
           uv pip install --system --no-deps -e .
 
       - name: Run unit tests
-        run: python -m pytest test/unit -v -rfE
+        env:
+          PYTEST_SELECTION: ${{ matrix.pytest_selection }}
+        run: python -m pytest test/unit -v -rfE -k "$PYTEST_SELECTION"

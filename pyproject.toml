@@ -13,6 +13,10 @@ requires-python = ">=3.10"
 # SGLang's CUDA image
 dependencies = []
 
+# Optional: only the explicit k3_full_decode profile uses these private APIs.
+[project.optional-dependencies]
+k3-full-decode = ["tokenspeed-mla==2.0.3", "apache-tvm-ffi==0.1.11"]
+
 # SGLang loads the package as a general plugin; --enable-nvidia-megakernel turns the
 # megakernel on
 [project.entry-points."sglang.srt.plugins"]

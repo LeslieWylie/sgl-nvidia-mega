@@ -17,7 +17,7 @@ import torch
 from cutlass import Float32, Float64, Int32, Uint64
 from cutlass.cute.runtime import make_fake_stream
 
-from ...common.host import fake, layout, stream, to_cute
+from ...common.host import fake, layout, stream, to_cute, validate_init_barrier_group
 from ...oproj.prepared import OprojMailbox
 from ..tail_runtime import POLL_CAP, compile_tail
 from .experts import ClusterExpertsTP8, ClusterExpertsTP16
@@ -56,7 +56,9 @@ def u32(t):
 class SmallBatchBox:
     """Model-owned small-batch storage, shared serially by every MoE layer."""
 
-    def __init__(self, group, device, tp, rank):
+    def __init__(self, group, device, tp, rank, *, init_barrier_group=None):
+        validate_init_barrier_group(group, init_barrier_group)
+
         def armed(shape, fill, dtype=torch.bfloat16):
             value = torch.empty(shape, dtype=dtype, device=device)
             value.view(torch.int32).fill_(fill)
@@ -71,7 +73,14 @@ class SmallBatchBox:
         self.ids = armed((16,), -1, torch.int32)
         self.w, self.s = armed((3, POLL_CAP, 16), -1), armed((3, POLL_CAP, 7168), -1)
         self.g = armed((3, POLL_CAP * 16, 3584), -1)
-        self.h2 = OprojMailbox(group, device, tp, rank, (2, POLL_CAP, 3584))
+        self.h2 = OprojMailbox(
+            group,
+            device,
+            tp,
+            rank,
+            (2, POLL_CAP, 3584),
+            init_barrier_group=init_barrier_group,
+        )
         self.latent = zeros(3584, dtype=torch.bfloat16)
         self.hg, self.counter = zeros(6144), zeros(1)
         self.tables = {}

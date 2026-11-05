@@ -23,7 +23,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_stream
 
-from ..common.host import fake
+from ..common.host import check_residency, fake, validate_init_barrier_group
 from ..common.primitives import (
     alloc,
     at,
@@ -42,9 +42,12 @@ from ..common.primitives import (
     store_shared_words,
     store_words,
     unpack_bf16,
+    wait_deadline_check,
+    wait_deadline_start,
     warp_sum,
     zeros,
 )
+from .query import _require_deadline_ns
 
 LSE_SENT = 0xFFFFFFFF  # a NaN pattern the merge never sends
 # The LSE of an empty or invalid source: finite, so the merge never forms inf - inf.
@@ -60,8 +63,37 @@ class DcpBox:
     and the local tokenspeed rows / LSE. Parity alternates by layer. ``interleave``:
     the KV cache's DCP interleave (global masking of spec verify rows)."""
 
-    def __init__(self, group, device, size, rank, heads, cap=64, interleave=1):
+    def __init__(
+        self,
+        group,
+        device,
+        size,
+        rank,
+        heads,
+        cap=64,
+        interleave=1,
+        *,
+        deadline_ns,
+        init_barrier_group=None,
+    ):
+        self.deadline_ns = _require_deadline_ns(deadline_ns)
+        if size not in (8, 16) or size * heads != 96 or not 0 <= rank < size:
+            raise ValueError("Kimi DCP needs TP8/12-head or TP16/6-head rank topology")
+        if cap != 64 or interleave != 1:
+            raise ValueError(
+                "Kimi DCP needs 64-row mailboxes and token-striped KV ownership "
+                "(interleave=1)"
+            )
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("Kimi DCP needs an initialized process group")
+        if (
+            torch.distributed.get_world_size(group) != size
+            or torch.distributed.get_rank(group) != rank
+        ):
+            raise ValueError("Kimi DCP rank topology differs from its process group")
+        init_group = validate_init_barrier_group(group, init_barrier_group)
         self.size, self.rank, self.heads, self.cap = size, rank, heads, cap
+        self.group = group
         self.interleave = interleave
         empty = symm_mem.empty
         self.q = empty((2, cap, size * heads, 576), dtype=torch.uint8, device=device)
@@ -69,7 +101,9 @@ class DcpBox:
         self.partial = empty((*shape, 512), dtype=torch.bfloat16, device=device)
         self.lse = empty(shape, dtype=torch.float32, device=device)
         tensors = (self.q, self.partial, self.lse)
-        handles = [symm_mem.rendezvous(t, group) for t in tensors]
+        self.handles = handles = tuple(symm_mem.rendezvous(t, group) for t in tensors)
+        if any(len(handle.buffer_ptrs) != size for handle in handles):
+            raise RuntimeError("Kimi DCP symmetric handles have a different rank count")
         self.q_mc = int(handles[0].multicast_ptr or 0)
         if not self.q_mc:
             raise RuntimeError("Kimi K3 specialized MLA DCP needs multicast memory")
@@ -83,10 +117,12 @@ class DcpBox:
         self.rows = torch.empty((*rows, 512), dtype=torch.bfloat16, device=device)
         self.rows_lse = torch.empty(rows, dtype=torch.float32, device=device)
         torch.accelerator.synchronize(device)
-        torch.distributed.barrier(group=group)
+        torch.distributed.barrier(group=init_group)
 
     def mc(self, parity):
         """The q mailbox multicast address of ``parity``."""
+        if parity not in (0, 1):
+            raise ValueError("Kimi DCP mailbox parity must be 0 or 1")
         return Int64(self.q_mc + parity * self.q[0].numel())
 
 
@@ -101,7 +137,12 @@ class DcpValue:
     MMA, FP32 accumulation) and the sigmoid gate follow as in MlaValue: warp w owns
     outputs 32 (w // 4) + 8 (w % 4) .. + 7. Rows are tokens, ``q`` per request."""
 
-    def __init__(self, heads, size, batch, sms=148, q=1):
+    def __init__(self, heads, size, batch, sms=148, q=1, *, deadline_ns):
+        self.deadline_ns = _require_deadline_ns(deadline_ns)
+        if size not in (8, 16) or size * heads != 96:
+            raise ValueError("Kimi DCP value has unsupported rank/head geometry")
+        if not 1 <= batch <= 64 or q <= 0 or batch % q or sms <= 0:
+            raise ValueError("Kimi DCP value has invalid prepared rows/query/SM bounds")
         self.heads, self.size, self.batch = heads, size, batch
         self.q = q
         # Push-only CTAs (z > 0) spread the NVLink stores over more SMs: up to one
@@ -182,7 +223,11 @@ class DcpValue:
             if lane < D:
                 source = at(lbox, lane, t0 + warp, head)
                 word = load_volatile(source)[0]
+                started, polls = Int64(0), Int32(0)
+                if word == Uint32(LSE_SENT):
+                    started = wait_deadline_start(self.deadline_ns)
                 while word == Uint32(LSE_SENT):
+                    polls = wait_deadline_check(started, polls, self.deadline_ns)
                     word = load_volatile(source)[0]
                 store_words(source, (Uint32(LSE_SENT),))
                 lse = bits_float(word)
@@ -212,7 +257,13 @@ class DcpValue:
                     loads = [load_volatile(source, count=4) for source in sources]
                     for i in cutlass.range_constexpr(len(sources)):
                         words = loads[i]
+                        started, polls = Int64(0), Int32(0)
+                        if not published(words):
+                            started = wait_deadline_start(self.deadline_ns)
                         while not published(words):
+                            polls = wait_deadline_check(
+                                started, polls, self.deadline_ns
+                            )
                             words = load_volatile(sources[i], count=4)
                         store_words(sources[i], (Uint32(PAIR_SENT),) * 4)
                         w = scales[r, s0 + i]
@@ -255,10 +306,15 @@ class DcpValue:
 
 
 @cache
-def compile_value(heads, size, batch, cap, uv, pitch, device, sms=148, q=1):
+def compile_value(
+    heads, size, batch, cap, uv, pitch, device, sms=148, q=1, *, deadline_ns
+):
     """DcpValue of one batch (``q`` rows per request); ``uv``: the (shape, stride,
     dtype) of W_UV, ``pitch``: the projected rows' (the gate follows the 2112 query /
     KV columns)."""
+    if cap != 64:
+        raise ValueError("Kimi DCP value requires its prepared 64-row mailbox")
+    kernel = DcpValue(heads, size, batch, sms, q, deadline_ns=deadline_ns)
     f32, i32 = torch.float32, torch.int32
     w_uv, gate = fake(*uv), fake((batch, heads * 128), (pitch, 1))
     rows = fake((batch, 1, size * heads, 512))
@@ -272,10 +328,75 @@ def compile_value(heads, size, batch, cap, uv, pitch, device, sms=148, q=1):
     args: tuple = (rows, rows_lse, lens, box, lbox, peers, peers, mailbox, w_uv)
     args += (gate, lens, output, Int32(0), Int32(0), make_fake_stream())
     with torch.accelerator.device_index(device):
-        return cute.compile(DcpValue(heads, size, batch, sms, q), *args)
+        compiled = cute.compile(kernel, *args)
+        check_residency(compiled, device, math.prod(kernel.grid), 512, "Kimi DCP value")
+        return compiled
 
 
 _WORKSPACE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _decode_metadata(md, device, heads, q_len, batch, max_seq, min_split, pack=False):
+    """Cache-independent launch geometry shared by preparation and execution."""
+    arch = torch.cuda.get_device_capability(device)
+    tiler, _ = md.select_mla_decode_tilers(
+        heads, q_len, is_fp8=True, compute_capability=arch
+    )
+    pack = pack and tiler[0] == 128
+    fold = 1 if pack else md.get_mla_decode_fold_sq_factor(heads, q_len, tiler[0])
+    rows = (q_len // fold, heads * fold)
+    if pack:
+        rows = (md.compute_q_tile_layout(heads, q_len, 128)[1], 128)
+    sms = md.get_num_sm(device)
+    split, size = md._get_split_kv_and_workspace_size(
+        batch, *rows, 512, sms, max_seq, torch.float8_e4m3fn, tiler, min_split
+    )
+    return arch, pack, fold, sms, split, size
+
+
+def _reserve_workspace(device, heads, size, sms):
+    key = device, heads
+    if key not in _WORKSPACE or _WORKSPACE[key].numel() < size:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the MLA split-KV workspace must be sized before capture"
+            )
+        bound = max(size, sms * heads * 513 * 4)
+        _WORKSPACE[key] = torch.empty(bound, dtype=torch.int8, device=device)
+    return _WORKSPACE[key]
+
+
+def prepare_workspace(
+    device, heads, max_seq, batches=(1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64), q=1
+):
+    """Reserve ordinary-decode tokenspeed scratch before KV-pool sizing.
+
+    Only host geometry is queried; this neither compiles nor launches a kernel,
+    and does not need a cache. Every prepared width shares the returned buffer.
+    """
+    from tokenspeed_mla import mla_decode as md
+
+    if q != 1 or not isinstance(max_seq, int) or max_seq <= 0:
+        raise ValueError(
+            "Kimi workspace preparation needs ordinary decode and a positive context"
+        )
+    batches = tuple(batches)
+    if not batches or any(
+        not isinstance(batch, int) or not 1 <= batch <= 64 for batch in batches
+    ):
+        raise ValueError("Kimi workspace preparation needs token-row widths in [1, 64]")
+    device = torch.device(device)
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Kimi MLA workspace must be prepared before capture")
+    maximum = 0
+    sms = None
+    for batch in batches:
+        metadata = _decode_metadata(
+            md, device, heads, q, batch, max_seq, fill_splits(batch, device)
+        )
+        sms = metadata[3]
+        maximum = max(maximum, metadata[5])
+    return _reserve_workspace(device, heads, maximum, sms)
 
 
 def stock_decode(
@@ -304,31 +425,15 @@ def stock_decode(
 
     batch, q_len, heads, _ = query.shape
     fp8, device = torch.float8_e4m3fn, query.device
-    arch = torch.cuda.get_device_capability(device)
-    tiler, _ = md.select_mla_decode_tilers(
-        heads, q_len, is_fp8=True, compute_capability=arch
-    )
-    pack = pack and tiler[0] == 128
-    fold = 1 if pack else md.get_mla_decode_fold_sq_factor(heads, q_len, tiler[0])
-    rows = (q_len // fold, heads * fold)
-    if pack:
-        rows = (md.compute_q_tile_layout(heads, q_len, 128)[1], 128)
-    sms = md.get_num_sm(device)
-    split, size = md._get_split_kv_and_workspace_size(
-        batch, *rows, 512, sms, max_seq, fp8, tiler, min_split
+    arch, pack, fold, sms, split, size = _decode_metadata(
+        md, device, heads, q_len, batch, max_seq, min_split, pack
     )
     # One split-KV workspace per (device, heads), shared by every MLA layer: the calls
-    # are stream ordered. PreparedMla.prepare_cache runs each prepared (batch, q) before
-    # any capture, so the buffer reaches its final size first; growing it during a
-    # capture would leave the graphs captured before with the freed buffer.
+    # are stream ordered. prepare_workspace reserves ordinary-decode widths before
+    # KV sizing; prepare_cache warms all shapes before capture. Growing during a
+    # capture would leave earlier graphs referring to the freed buffer.
     key = device, heads
-    if key not in _WORKSPACE or _WORKSPACE[key].numel() < size:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "the MLA split-KV workspace must be sized before capture"
-            )
-        bound = max(size, sms * heads * 513 * 4)
-        _WORKSPACE[key] = torch.empty(bound, dtype=torch.int8, device=device)
+    _reserve_workspace(device, heads, size, sms)
     kernel = md._get_compiled_mla_kernel(
         torch_dtype=fp8,
         page_size=cache.shape[1],
@@ -338,6 +443,7 @@ def stock_decode(
         is_var_seq=True,
         is_var_split_kv=False,
         compute_capability=arch,
+        has_local_visible_lens=False,
         skip_correction_threshold=8.0,
         is_workspace_size_zero=size == 0,
         fold_sq_factor=fold,

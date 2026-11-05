@@ -24,6 +24,10 @@ Qwen3.5 EAGLE entries, respectively. For Kimi K3, the plugin covers the 93-layer
 language model (24 MLA and 69 KDA layers) at the listed widths; every other call
 runs the standard path.
 
+For the opt-in B300/SM103 TP8 DCP and HiCache extension, see
+[Kimi K3 TP8 decode](docs/kimi-k3-tp8-dcp.md). The default Kimi profile below
+retains its existing admission.
+
 The Kimi K3 adapter is experimental. On the pinned GB300/TP8 configuration
 below, every listed CUDA-graph width and padding boundary passed dummy-weight
 capture/replay, B1 and B16 passed stock-versus-plugin real-weight canaries, and a
