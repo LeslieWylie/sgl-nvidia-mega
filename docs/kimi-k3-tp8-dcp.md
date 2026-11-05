@@ -27,10 +27,19 @@ signatures before constructing resources or capturing graphs.
 The profiles admit single-node SM103 TP8, DCP1 or DCP8, BF16 activations,
 packed-MXFP4 experts, FP8 E4M3 KV, page size 64 and full decode graphs. Devices
 need at least 148 SMs and must pass the compiled-kernel residency checks.
-The prepared widths are 1–8, 16, 32, 48 and 64 requests. Other widths, prefill,
-embedding-only calls and pipeline proxy calls retain the original model forward.
-Ordinary eager decode may also enter a prepared specialized width; this differs
-from the graph-only routing in the vLLM reference.
+Preparation merges the default widths 1–8, 16, 32, 48 and 64 with configured
+request buckets up to 64. SGLang passes an immutable copy of those request buckets
+before KV sizing; this NOSPEC profile consumes each bucket once. A configured
+24- or 37-request graph can therefore use the complete specialized chain.
+Widths above 64, prefill, embedding-only calls and pipeline proxy calls retain
+the original model forward. Eager execution, profiling and warmup also use the
+original model; only full decode graph capture selects the specialized chain.
+
+A later request-pool clamp can synthesize a bucket not prepared before KV sizing.
+That bucket remains native; no new provider or persistent workspace is allocated
+at replay. The existing framework still refuses an enabled runner if none of its
+captured buckets uses the specialized path. Additional prepared shapes consume
+resources, so earlier image capacity measurements do not qualify a new shape set.
 
 The configured context may be up to 1,048,576 tokens, also bounded by the native
 model limit. Admission is not evidence that the entire context range is tested.
@@ -56,8 +65,11 @@ The comparison source is [vLLM #61867](https://github.com/vllm-project/vllm/pull
 at `063c0c6d25658ed0702670b2fd07f02f21cadf10`; L2 prefetch orchestration is adapted
 from its runtime. Apache notices and file-level attribution are retained.
 B1/B2 projections reuse SGLang's `tiny_gemm`; they do not copy vLLM's skinny
-GEMM or establish identical scheduling, numerics or speed. Expert launches also
-retain the existing cooperative policy.
+GEMM or establish identical scheduling, numerics or speed. The extended profiles
+now use non-cooperative expert launch to retain PDL overlap, matching the reference
+policy. The launch choice is part of the compiled-code cache key; actual compiled
+residency checks remain required. The default community profile stays cooperative.
+No speedup is claimed for this source-only scheduling change.
 
 Earlier validation of the source feature used B300 SM103 TP8/DCP8, NOSPEC,
 the full 93 layers and a separately pinned image plus memory/inference profile.
@@ -76,9 +88,11 @@ an individual-kernel result or a reproduction of vLLM's measurements. The origin
 continuation completed the remaining checks with zero generation POSTs. The
 original failure is retained, so this is not an original strict-comparator pass.
 
-Those results do not GPU-qualify the extracted upstream branches. Their CUDA
-compilation, full-model correctness, task quality and net performance need fresh
-validation. No full 1M-input test, all-workload equivalence, active-cancel/delete/
+Those results do not GPU-qualify the extracted upstream branches. Configured
+bucket preparation, native warmup routing and expert launch policy changed after
+that run. Its effective 133-request capacity is not a capacity promise for this
+source pair. CUDA compilation, full-model correctness, task quality and net
+performance need fresh validation. No full 1M-input test, all-workload equivalence, active-cancel/delete/
 expiry coverage or DSpark qualification is claimed.
 
 ## CPU CI dependency

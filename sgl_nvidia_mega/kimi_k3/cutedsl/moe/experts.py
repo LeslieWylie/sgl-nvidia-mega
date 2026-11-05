@@ -280,8 +280,10 @@ def fc2_pairs(tp, capacity, streamed):
 
 class ExpertsKernel(ExpertsGeometry):
     """The engine for one capacity and persistent grid. CTAs wait on other clusters'
-    partials (``load_hidden``, ``partials``, ``finalize``), so the grid launches
-    cooperatively and ``PersistentExperts.prepare`` checks it is co-resident.
+    partials (``load_hidden``, ``partials``, ``finalize``), so
+    ``PersistentExperts.prepare`` checks that the grid is co-resident. Extended
+    profiles use non-cooperative launch for PDL prologue overlap; the community
+    default remains cooperative.
     ``publish`` stages FC2 rows for ``finalize``: routing weights replace the output
     arg, and (latent multicast, parity, rank) follow the SiTU scalars; ``"twoshot"``:
     (receive slots [3 x TP, 64, 3584/TP], their owners' bases, parity x TP + rank) of
@@ -296,9 +298,10 @@ class ExpertsKernel(ExpertsGeometry):
 
     def __init__(
         self, tp, capacity, experts, grid, publish=False,
-        stream=True, pregrouped=False, steal=False,
+        stream=True, pregrouped=False, steal=False, *, cooperative=True,
     ):  # fmt: skip
         super().__init__(tp, capacity)
+        self.cooperative = cooperative
         self.pregrouped = pregrouped and self.grouped
         self.steal = steal and self.grouped
         self.streamed = stream or self.grouped
@@ -1399,7 +1402,9 @@ class ExpertsKernel(ExpertsGeometry):
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, self.grid, 384, cluster=1, cooperative=True)
+        launch(
+            self.kernel, args, self.grid, 384, cluster=1, cooperative=self.cooperative
+        )
 
     @cute.jit
     def initialize(self, sm, maps, batch):

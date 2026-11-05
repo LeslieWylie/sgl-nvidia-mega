@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Graph48 host preparation/admission; no CUDA kernels or collectives execute."""
+"""Selected-width host preparation/admission; no CUDA kernels or collectives execute."""
 
 import importlib
 import sys
@@ -11,8 +11,11 @@ import torch
 
 
 @pytest.mark.parametrize("profile", ["k3_native_mla", "k3_full_decode"])
-def test_graph48_is_opt_in_and_the_build_prepares_exact_admitted_widths(
-    monkeypatch, profile
+@pytest.mark.parametrize(
+    "capture_widths,expected", [(None, (48,)), ((37, 48, 96), (37, 48))]
+)
+def test_selected_graph_widths_are_prepared_before_capture_and_eager_stays_native(
+    monkeypatch, profile, capture_widths, expected
 ):
     from sglang.kernels.plugin_kernels.nvidia.spec import BuildContext
     from sglang.srt import runtime_context
@@ -27,7 +30,8 @@ def test_graph48_is_opt_in_and_the_build_prepares_exact_admitted_widths(
             assert 48 in spec.WIDTHS
             assert 48 not in spec.BASE_WIDTHS
             context = BuildContext(
-                widths=(48, 96, 128),
+                widths=(37, 48, 96, 128),
+                capture_widths=capture_widths,
                 tokens_per_request=1,
                 deadline_s=30,
                 binding=SimpleNamespace(native_mla_api_version=1),
@@ -61,33 +65,48 @@ def test_graph48_is_opt_in_and_the_build_prepares_exact_admitted_widths(
                 built = spec._build(
                     SimpleNamespace(language_model=object()), None, context
                 )
-            assert built.widths == (48,)
-            assert build.call_args.kwargs["batches"] == (48,)
+            assert built.widths == expected
+            assert build.call_args.kwargs["batches"] == expected
             assert build.call_args.kwargs[
                 "native_mla" if profile == "k3_native_mla" else "full_decode"
             ]
             mode = SimpleNamespace(is_decode=lambda: True)
-            plan = built.plan(
-                SimpleNamespace(shape=(48,)),
-                SimpleNamespace(forward_mode=mode, batch_size=48),
-            )
-            assert plan.rows == 48 and plan.mode == "decode"
-            for rows in (32, 64, 96, 128):
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ):
                 assert (
                     built.plan(
-                        SimpleNamespace(shape=(rows,)),
-                        SimpleNamespace(forward_mode=mode, batch_size=rows),
+                        SimpleNamespace(shape=(48,)),
+                        SimpleNamespace(forward_mode=mode, batch_size=48),
                     )
                     is None
                 )
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                for rows in expected:
+                    plan = built.plan(
+                        SimpleNamespace(shape=(rows,)),
+                        SimpleNamespace(forward_mode=mode, batch_size=rows),
+                    )
+                    assert plan.rows == rows and plan.mode == "decode"
+                # Unprepared post-KV clamp bins never trigger a late build.
+                for rows in (24, 32, 64, 96, 128):
+                    assert (
+                        built.plan(
+                            SimpleNamespace(shape=(rows,)),
+                            SimpleNamespace(forward_mode=mode, batch_size=rows),
+                        )
+                        is None
+                    )
     finally:
         importlib.reload(spec)
     assert spec.WIDTHS == spec.BASE_WIDTHS
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_actual_graph48_build_threads_width_through_all_93_layers_and_workspaces(
-    monkeypatch, native
+@pytest.mark.parametrize("native,width", [(False, 37), (True, 48)])
+def test_actual_selected_width_build_reaches_all_93_layers_and_workspaces(
+    monkeypatch, native, width
 ):
     from sgl_nvidia_mega.kimi_k3 import prefetch, providers
 
@@ -109,7 +128,8 @@ def test_actual_graph48_build_threads_width_through_all_93_layers_and_workspaces
 
     class Node:
         def __init__(self, *args, **kwargs):
-            pass
+            if "cooperative" in kwargs:
+                trace.append(("expert_cooperative", kwargs["cooperative"]))
 
         def bind_ring(self, tensor):
             self.ring = tensor
@@ -295,31 +315,34 @@ def test_actual_graph48_build_threads_width_through_all_93_layers_and_workspaces
         deadline_ns=30_000_000_000,
         native_mla=native,
         full_decode=not native,
-        batches=(48,),
+        batches=(width,),
     )
-    assert resources.batches == (48,)
+    assert resources.batches == (width,)
     assert len(resources.attention) == len(resources.feed_forward) == 93
+    assert trace.count(("expert_cooperative", False)) == 93
     assert [
         key for key, value in resources.attention.items() if value.kind == "mla"
     ] == full_ids
     for value in resources.attention.values():
         projection = value.projection if native else value.projection.fallback
         assert projection.policies == {
-            48: (64, 64, 2, 5) if value.kind == "mla" else (64, 64, 1, 6)
+            width: (64, 64, 2, 5) if value.kind == "mla" else (64, 64, 1, 6)
         }
-        assert value.core.policies == {48: 3648 if value.kind == "mla" else (6288, 0)}
-        assert value.output.batches == (48,)
+        assert value.core.policies == {
+            width: 3648 if value.kind == "mla" else (6288, 0)
+        }
+        assert value.output.batches == (width,)
     assert all(
-        value.state.batches == value.front.batches == value.tail.batches == (48,)
+        value.state.batches == value.front.batches == value.tail.batches == (width,)
         for value in resources.feed_forward.values()
     )
     if not native:
-        assert trace[0] == ("workspace", 96, 131072, (48,))
+        assert ("workspace", 96, 131072, (width,)) in trace
         assert resources.embedding is not None
     else:
         assert not any(row[0] == "workspace" for row in trace)
     assert all(
-        row["batches"] == [48]
+        row["batches"] == [width]
         for row in resources.compilation_inventory
         if "batches" in row
     )
@@ -327,7 +350,15 @@ def test_actual_graph48_build_threads_width_through_all_93_layers_and_workspaces
 
 @pytest.mark.parametrize(
     "batches,extended",
-    [((48,), False), ((96,), True), ((128,), True), ((9,), True), ((), True)],
+    [
+        ((48,), False),
+        ((96,), True),
+        ((128,), True),
+        ((9,), False),
+        ((0,), True),
+        ((True,), True),
+        ((), True),
+    ],
 )
 def test_unadmitted_resource_widths_are_rejected_before_cuda_import(batches, extended):
     from sgl_nvidia_mega.kimi_k3 import providers

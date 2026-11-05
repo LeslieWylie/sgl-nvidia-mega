@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from sglang.srt.runtime_context import get_model
 
 from .profile import full_decode_enabled, native_config_reasons, native_mla_enabled
+from .shape_policy import DECODE_WIDTHS, prepared_widths
 
 try:
     from sglang.kernels.plugin_kernels.nvidia.spec import (
@@ -44,7 +45,7 @@ NATIVE_MLA = native_mla_enabled()
 FULL_DECODE = full_decode_enabled()
 EXTENDED_PROFILE = NATIVE_MLA or FULL_DECODE
 BASE_WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-WIDTHS = (*BASE_WIDTHS[:-1], 48, 64) if EXTENDED_PROFILE else BASE_WIDTHS
+WIDTHS = DECODE_WIDTHS if EXTENDED_PROFILE else BASE_WIDTHS
 # Keep this independent of the host constant so find_spec rejects incompatibility.
 REQUIRED_MEGAKERNEL_API_VERSION = 2
 
@@ -62,6 +63,7 @@ SGLANG_READS = {
         "Step",
         "TOLERANCE",
         "binding",
+        "capture_widths",
         "deadline_s",
         "mode",
         "prepare",
@@ -290,6 +292,7 @@ class _Built:
         self.model = model
         self.language_model = model.language_model
         self.resources = resources
+        self.capture_only = EXTENDED_PROFILE
         self.widths = widths
         self.executor = KimiK3MegakernelExecutor(resources)
         # Local validation observers read this without changing the public API.
@@ -309,6 +312,13 @@ class _Built:
     def plan(
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
     ) -> Step | None:
+        if getattr(self, "capture_only", False):
+            import torch
+
+            # Keep profiling and warmup native so fallback kernels are ready
+            # before graph capture. Only full decode graphs run this profile.
+            if not torch.cuda.is_current_stream_capturing():
+                return None
         get_embedding = bool(_call_option(args, kwargs, 0, "get_embedding", False))
         pp_proxy_tensors = _call_option(args, kwargs, 1, "pp_proxy_tensors", None)
         if get_embedding or pp_proxy_tensors is not None:
@@ -359,7 +369,11 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
     if context.tokens_per_request != 1:
         raise ValueError("Kimi K3 megakernel serves one-token decode only")
-    widths = tuple(width for width in context.widths if width in WIDTHS)
+    widths = (
+        prepared_widths(context.widths, getattr(context, "capture_widths", None))
+        if EXTENDED_PROFILE
+        else tuple(width for width in context.widths if width in WIDTHS)
+    )
     if not widths:
         raise ValueError(
             f"Kimi K3 megakernel found no supported width in {list(context.widths)}"

@@ -60,13 +60,25 @@ def stealing(batch):
 
 
 @functools.cache
-def compile_experts(tp, experts, batch, grid, device, publish=False, *knobs):
+def compile_experts(
+    tp, experts, batch, grid, device, publish=False, *knobs, cooperative=True
+):
     """Only code and geometry are cached; no owner tensors or descriptors. ``knobs``:
     (B<=8 stream, pregrouped, steal)."""
     defaults = (streamed(batch), False, False)
     stream, grouped, steal = knobs + defaults[len(knobs) :]
     capacity = 1 << (batch - 1).bit_length()
-    moe = ExpertsKernel(tp, capacity, experts, grid, publish, stream, grouped, steal)
+    moe = ExpertsKernel(
+        tp,
+        capacity,
+        experts,
+        grid,
+        publish,
+        stream,
+        grouped,
+        steal,
+        cooperative=cooperative,
+    )
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
     if publish == "twoshot":  # receive slots, owners' bases, parity x TP + rank
@@ -122,7 +134,9 @@ class PersistentExperts:
         beta=4.0,
         linear_beta=25.0,
         resident_sms=None,
+        cooperative=True,
     ):
+        self.cooperative = cooperative
         experts, rows, _ = w13.shape
         self.tp, self.grid = (8, 136) if rows == 768 else (16, 152)
         self.device, self.experts = w13.device, experts
@@ -176,7 +190,9 @@ class PersistentExperts:
         grouped = pregrouped(self.tp, batch)
         args: tuple = (batch, self.grid_for(batch), self.device.index, mode)
         args += (streamed(batch), grouped, stealing(batch))
-        code = compile_experts(self.tp, self.experts, *args)
+        code = compile_experts(
+            self.tp, self.experts, *args, cooperative=self.cooperative
+        )
         # CTAs wait on other clusters' partials: the whole grid must be resident.
         check_residency(code, self.device.index, args[1], 384, "Kimi K3 MoE experts")
         ws, maps = tensor(buffers["workspace"]), self.views[0]

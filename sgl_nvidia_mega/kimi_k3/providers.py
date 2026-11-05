@@ -750,12 +750,14 @@ def build_resources(
     """Prepare each admitted TP8 token-row width after all-rank consensus."""
 
     batches = tuple(batches)
-    if not batches or any(
-        type(batch) is not int or batch not in (*_BATCHES, 48) for batch in batches
-    ):
-        raise ValueError("Kimi K3 resources need prepared rows 1-8/16/32/48/64")
-    if 48 in batches and not (native_mla or full_decode):
+    extended = native_mla or full_decode
+    if 48 in batches and not extended:
         raise ValueError("Kimi K3 Graph48 requires an explicit extended profile")
+    supported = range(1, _MAX_BATCH + 1) if extended else _BATCHES
+    if not batches or any(
+        type(batch) is not int or batch not in supported for batch in batches
+    ):
+        raise ValueError("Kimi K3 resources need supported prepared rows within 1-64")
     batches = tuple(sorted(set(batches)))
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
@@ -1071,6 +1073,7 @@ def build_resources(
             routed.w2_weight_scale,
             beta=beta,
             linear_beta=linear_beta,
+            cooperative=not extended,
             resident_sms=(
                 torch.cuda.get_device_properties(device).multi_processor_count
                 if native_mla or full_decode
