@@ -58,6 +58,31 @@ checks DCP mailbox topology and uses a one-wave DCP B2 query tile. Initializatio
 synchronizes local GPU writes before a Gloo barrier with the same ordered members
 as the device group, avoiding initialization of unused device collectives.
 
+## AttnRes and streaming correctness fixes
+
+ClusterAttnRes and the output-projection consumer now form the combined FP32
+residual vector before summing its squares. The previous expanded quadratic
+could become negative through cancellation even for finite BF16 inputs, causing
+NaNs in RMS normalization. The direct norm uses a separate reduction and barrier
+phase; prefix/bank publication, the empty-bank path and final-layer rounding
+retain their existing behavior.
+
+An isolated SM103 GPU witness on the private integration reproduced NaNs with
+the old consumers at B1/B64 in eager and CUDA Graph execution. The patched
+consumers were finite and matched the synthetic reference with zero maximum
+absolute error; empty-bank and final branches were also checked. These results
+cover those consumers, not TP8 producer communication, full-model task quality,
+or the cause of a real-request output anomaly. The public CPU test preserves a
+compact cancellation counterexample. The actual-consumer regression is available
+with `python -m pytest test/kernels/test_kimi_k3_attnres_stability.py` on SM103;
+it covers eager/graph execution and the same branches, but this public port and
+its new compact fixture have not been run on a GPU.
+
+The companion SGLang change also keeps the incremental detokenizer's sent cursor
+monotonic when an incomplete UTF-8 prefix shrinks. This prevents duplicate text
+without changing tokenizer assets. Its regression exercises the current
+incremental state API rather than copying an older manager implementation.
+
 ## Source and validation scope
 
 The existing executor and kernel payload remain SGLang/NVIDIA community work.
@@ -93,14 +118,16 @@ original failure is retained, so this is not an original strict-comparator pass.
 One integrated-build run per arm; all formal requests hit the 300-token output
 cap. The figure compares the source/image and memory/inference profile together,
 with no estimate of run-to-run variance. It does not measure the current PR heads.
+It predates the AttnRes and Unicode fixes above and does not establish their
+performance or the earlier build's task quality.
 [Aggregate data](assets/kimi-k3-tp8/measurements.json), the
 [plot script](assets/kimi-k3-tp8/plot_measurements.py) and a
 [vector PDF](assets/kimi-k3-tp8/integrated-comparison.pdf) are included.
 
 Those results do not GPU-qualify the extracted upstream branches. Configured
-bucket preparation, native warmup routing and expert launch policy changed after
-that run. Its effective 133-request capacity is not a capacity promise for this
-source pair. CUDA compilation, full-model correctness, task quality and net
+bucket preparation, native warmup routing, expert launch policy and AttnRes
+normalization changed after that run. Its effective 133-request capacity is not
+a capacity promise for this source pair. CUDA compilation, full-model correctness, task quality and net
 performance need fresh validation. No full 1M-input test, all-workload equivalence, active-cancel/delete/
 expiry coverage or DSpark qualification is claimed.
 

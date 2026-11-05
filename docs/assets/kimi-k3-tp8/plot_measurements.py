@@ -69,7 +69,7 @@ fig.text(
     0.5,
     0.10,
     "B300 · TP8/DCP8 · no speculation · 32K input / 300 output incl. reasoning · C64\n"
-    "One integrated-build run per arm; 128 formal requests each. Whole package + profile comparison.",
+    "Historical pre-fix build; one run per arm, 128 requests each. Whole package + profile comparison.",
     ha="center",
     va="center",
     fontsize=9,

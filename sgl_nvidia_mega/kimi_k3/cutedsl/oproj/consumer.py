@@ -124,7 +124,7 @@ class OprojConsumer:
         self.groups, self.twoshot = groups, twoshot
         self.deadline_ns = deadline_ns
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
-        self.npost = 4 if nb > 0 else 1
+        self.npost = 2 if nb > 0 else 1
 
     @cute.jit
     def wait_exchange(self, barrier):
@@ -138,7 +138,7 @@ class OprojConsumer:
         blk = alloc(smem, Float32, 16)
         post = alloc(smem, Float32, (7, 4, 4))
         total = alloc(smem, Float32, 4)
-        bars = alloc(smem, cutlass.Uint64, 2, 8)
+        bars = alloc(smem, cutlass.Uint64, 3, 8)
         parts = alloc(smem, Float32, (max(1, self.groups - 1), 2, 128, 4))
         lean = self.groups == 1  # above B8: rows for this nb only (co-residency)
         pf = alloc(smem, Uint32, (4 + self.nb if lean else 12, 128, 4))
@@ -146,7 +146,7 @@ class OprojConsumer:
 
     @cute.jit
     def setup(self, bars):
-        arm_exchanges(bars, (2 * self.nb, 4 * self.npost))
+        arm_exchanges(bars, (2 * self.nb, 4 * self.npost, 4 if self.nb else 0))
         cute.arch.cluster_arrive_relaxed()
 
     @cute.jit
@@ -284,7 +284,7 @@ class OprojConsumer:
     def post(self, args, state, block_mix, rank, token):
         mailbox, prefix, _, _, _, _, output, xmoe, hints, eps, out_eps = args[:11]
         _, _, _, post, total, bars, parts, pf = state
-        mix, maximum, exponent_sum, qpart = block_mix
+        mix, maximum, exponent_sum, _qpart = block_mix
         thread, _, _ = cute.arch.thread_idx()
         group, tid = thread // 128, thread % 128
         warp, lane = tid // 32, tid % 32
@@ -337,9 +337,8 @@ class OprojConsumer:
             partial = cute.make_rmem_tensor(self.npost, Float32)
             if cutlass.const_expr(self.nb > 0):
                 weight = self.combined_weight(pf, tid)
-                partial[0], partial[1] = dot8(mix, prefix_value), qpart
-                partial[2] = dot8(prefix_value, prefix_value)
-                partial[3] = dot8(prefix_value, weight)
+                partial[0] = dot8(prefix_value, prefix_value)
+                partial[1] = dot8(prefix_value, weight)
             else:
                 partial[0] = dot8(prefix_value, prefix_value)
             idx = reduce_scatter(partial, self.npost, lane)
@@ -364,22 +363,40 @@ class OprojConsumer:
             norm = self.fragment(pf, 2, tid)
             final = cute.make_rmem_tensor(8, Float32)
             if cutlass.const_expr(self.nb > 0):
-                lp = mul_rn(total[3], rstd(total[2], eps))
+                lp = mul_rn(total[1], rstd(total[0], eps))
                 mx = max(maximum, lp)
                 alpha = cute.math.exp(maximum - mx, fastmath=True)
                 ep = cute.math.exp(lp - mx, fastmath=True)
                 den = fma(alpha, exponent_sum, ep)
-                a2, t1 = mul_rn(alpha, alpha), total[1]
-                ae2 = mul_rn(mul_rn(2.0, alpha), ep)
-                quad = fma(a2, t1, fma(ae2, total[0], mul_rn(mul_rn(ep, ep), total[2])))
-                scale = rstd(quad, mul_rn(mul_rn(out_eps, den), den))
-                ca, cp = mul_rn(alpha, scale), mul_rn(ep, scale)
+                for j in cutlass.range_constexpr(4):
+                    value = pair_op((ep, ep), two(prefix_value, j), op="mul")
+                    value = pair_op((alpha, alpha), two(mix, j), value, op="fma")
+                    final[2 * j], final[2 * j + 1] = value[0], value[1]
+                # Slots 0/1 carry prefix statistics; slot 2 is disjoint and
+                # carries the formed vector's norm. Four warp pushes per CTA
+                # match the third cluster barrier's 4 * 7 FP32 arrivals.
+                norm_sq = cute.make_rmem_tensor(1, Float32)
+                norm_sq[0] = dot8(final, final)
+                reduce_scatter(norm_sq, 1, lane)
+                if lane < 7:
+                    push_float(
+                        at(post, rank, warp, 2), norm_sq[0], bars.iterator + 2, lane
+                    )
+                self.wait_exchange(bars.iterator + 2)
+                if tid == 0:
+                    sums = [Float32(0)] * 4
+                    for peer in cutlass.range_constexpr(7):
+                        for w in cutlass.range_constexpr(4):
+                            sums[w] = add_rn(sums[w], post[peer, w, 2])
+                    total[2] = tree_reduce(sums, add_rn)
+                named_barrier()
+                scale = rstd(total[2], mul_rn(mul_rn(out_eps, den), den))
             else:
-                cp = rstd(total[0], out_eps)
+                scale = rstd(total[0], out_eps)
+                for j in cutlass.range_constexpr(4):
+                    final[2 * j], final[2 * j + 1] = two(prefix_value, j)
             for j in cutlass.range_constexpr(4):
-                value = pair_op((cp, cp), two(prefix_value, j), op="mul")
-                if cutlass.const_expr(self.nb > 0):
-                    value = pair_op((ca, ca), two(mix, j), value, op="fma")
+                value = pair_op((scale, scale), two(final, j), op="mul")
                 value = pair_op(value, two(norm, j), op="mul")
                 final[2 * j], final[2 * j + 1] = value[0], value[1]
             self.publish(output, xmoe, hints, token, h, final)

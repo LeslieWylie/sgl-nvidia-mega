@@ -84,7 +84,7 @@ class ClusterAttnRes:
         self.write, self.final = write, final
         self.deadline_ns = deadline_ns
         self.npre = 2 * nb
-        self.npost = (2 if final else 4) if nb else 1
+        self.npost = 2 if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
         self.kpost = 1 << max(self.npost - 1, 0).bit_length()
 
@@ -141,7 +141,7 @@ class ClusterAttnRes:
         peer_buf = alloc(smem, Float32, (3, 112))
         total = alloc(smem, Float32, (3, 16))
         bars = alloc(smem, Uint64, 3, 8)
-        arm_exchanges(bars, (self.npre, self.npost, int(self.final)))
+        arm_exchanges(bars, (self.npre, self.npost, int(self.final or self.nb > 0)))
         return warp_buf, peer_buf, total, bars
 
     @cute.jit
@@ -242,9 +242,6 @@ class ClusterAttnRes:
         values[0] = dot8(v, NEW, v, NEW)
         if cutlass.const_expr(self.nb > 0):
             values[1] = dot8(v, NEW, v, W)
-            if cutlass.const_expr(not self.final):
-                values[2] = dot8(mixture, 0, v, NEW)
-                values[3] = dot8(mixture, 0, mixture, 0)
         self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
         store_words(at(prefix, token, col), row)
@@ -279,13 +276,16 @@ class ClusterAttnRes:
                 for i in cutlass.range_constexpr(8):
                     result[0, i] = result[0, i] * scale * v[G, i]
             else:
-                a2, t3 = alpha * alpha, total[1, 3]
-                ae2 = Float32(2) * alpha * ep
-                quad = fma(a2, t3, fma(ae2, total[1, 2], ep * ep * ss))
-                scale = rstd(quad, out_eps * denominator * denominator)
-                ca, cp = alpha * scale, ep * scale
+                # Squaring the formed vector avoids cancellation in the expanded
+                # quadratic norm when bank and prefix rows nearly oppose.
                 for i in cutlass.range_constexpr(8):
-                    result[0, i] = fma(ca, mixture[0, i], cp * v[NEW, i]) * v[G, i]
+                    result[0, i] = fma(alpha, mixture[0, i], ep * v[NEW, i])
+                fin = cute.make_rmem_tensor(1, Float32)
+                fin[0] = dot8(result, 0, result, 0)
+                self.exchange(fin, 1, 1, bufs, 2, ids)
+                scale = rstd(total[2, 0], out_eps * denominator * denominator)
+                for i in cutlass.range_constexpr(8):
+                    result[0, i] = result[0, i] * scale * v[G, i]
         for j in cutlass.range_constexpr(4):
             words[j] = bf16x2(result[0, 2 * j], result[0, 2 * j + 1])
         store_words(at(output, token, col), tuple(words[j] for j in range(4)))

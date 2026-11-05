@@ -53,13 +53,14 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 # Baseline payload shipped in a0a97a0 (#17). This branch changes the query's
-# DCP slot mapping, prepared native callback and SM-bounded expert schedule.
+# DCP slot mapping, prepared native callback, SM-bounded expert schedule and
+# cancellation-safe AttnRes norm.
 # Historical GPU evidence does not qualify this candidate payload.
 BASELINE_PAYLOAD_SHA256 = (
     "317036ce5d069f1eb68ac110032d7a7f310ad78e2565fd605ed04e968c2aa82a"
 )
 CANDIDATE_PAYLOAD_SHA256 = (
-    "96b19518f2572564dd96b9e519aef0723713b724b126eb77e66507b0363a4121"
+    "cbc255b91937ffb4550e5c054a50e76df97ae92d2efc2319f0a4c4f5bd539879"
 )
 
 

@@ -30,7 +30,7 @@ jobs:
             pytest_selection: "not kimi and not the_binding_tolerates_exactly_the_pinned_sglang_code and not every_binding_callable_the_plugin_reads_is_tolerated"
           - suite: kimi-tp8
             sglang_repository: LeslieWylie/sglang
-            sglang_commit: b3b1da2c101ab604ccffe5e19dd3099d2e8f2835
+            sglang_commit: d7e122c3d4a71691c14b35a054a6979272eea63d
             pytest_selection: "kimi or the_binding_tolerates_exactly_the_pinned_sglang_code or every_binding_callable_the_plugin_reads_is_tolerated"
     name: Unit Test (${{ matrix.suite }})
     steps:

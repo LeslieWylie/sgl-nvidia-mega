@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "measurement_date": "2026-11-04",
-  "scope": "Historical integrated image plus memory/inference profile; not a benchmark of the extracted public PR heads.",
+  "scope": "Historical pre-fix integrated image plus memory/inference profile; not a benchmark of the patched public PR heads.",
   "source_receipt_sha256": "529d853fbd4fdfc139f56b857a9b9d6b4346cc941671c2fe8da97da7f9e3eeca",
   "conditions": {
     "hardware": "B300 SM103",
@@ -34,6 +34,7 @@
     }
   },
   "notes": [
+    "Measurements predate the AttnRes normalization and Unicode streaming fixes; they establish neither post-fix performance nor the earlier build task quality.",
     "OFF and ON differ in source/image and memory/inference profile. This is not a same-image switch or isolated-kernel comparison.",
     "Output throughput is total formal output tokens divided by the complete formal wall, including drain.",
     "p95 TTFT is the original run-summary value, not a recomputed linearly interpolated quantile.",
