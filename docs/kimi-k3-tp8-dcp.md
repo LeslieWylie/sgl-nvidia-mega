@@ -88,6 +88,15 @@ an individual-kernel result or a reproduction of vLLM's measurements. The origin
 continuation completed the remaining checks with zero generation POSTs. The
 original failure is retained, so this is not an original strict-comparator pass.
 
+![Historical integrated-build throughput and p95 TTFT](assets/kimi-k3-tp8/integrated-comparison.png)
+
+One integrated-build run per arm; all formal requests hit the 300-token output
+cap. The figure compares the source/image and memory/inference profile together,
+with no estimate of run-to-run variance. It does not measure the current PR heads.
+[Aggregate data](assets/kimi-k3-tp8/measurements.json), the
+[plot script](assets/kimi-k3-tp8/plot_measurements.py) and a
+[vector PDF](assets/kimi-k3-tp8/integrated-comparison.pdf) are included.
+
 Those results do not GPU-qualify the extracted upstream branches. Configured
 bucket preparation, native warmup routing and expert launch policy changed after
 that run. Its effective 133-request capacity is not a capacity promise for this
